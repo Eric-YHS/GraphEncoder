@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 from models.common import compose_context, ShiftedSoftplus
 from models.egnn import EGNN
 from models.uni_transformer import UniTransformerO2TwoUpdateGeneral
+from models.uni_transformer_condition import UniTransformerO2TwoUpdateGeneral_CFG
 
 
 def get_refine_net(refine_net_type, config):
@@ -30,6 +31,27 @@ def get_refine_net(refine_net_type, config):
             r_max=config.r_max,
             x2h_out_fc=config.x2h_out_fc,
             sync_twoup=config.sync_twoup
+        )
+    elif refine_net_type == 'uni_o2_condition':
+        refine_net = UniTransformerO2TwoUpdateGeneral_CFG(
+            num_blocks=config.num_blocks,
+            num_layers=config.num_layers,
+            hidden_dim=config.hidden_dim,
+            n_heads=config.n_heads,
+            k=config.knn,
+            edge_feat_dim=config.edge_feat_dim,
+            num_r_gaussian=config.num_r_gaussian,
+            num_node_types=config.num_node_types,
+            act_fn=config.act_fn,
+            norm=config.norm,
+            cutoff_mode=config.cutoff_mode,
+            ew_net_type=config.ew_net_type,
+            num_x2h=config.num_x2h,
+            num_h2x=config.num_h2x,
+            r_max=config.r_max,
+            x2h_out_fc=config.x2h_out_fc,
+            sync_twoup=config.sync_twoup,
+            graph_cond_dim = config.hidden_dim,
         )
     elif refine_net_type == 'egnn':
         refine_net = EGNN(
@@ -407,24 +429,274 @@ class MolPosDiffusion(nn.Module):
             "pred_x0": pred,
         }
 
+class MolPosDiffusion_condition(nn.Module):
+    """
+    Molecule-only, position-only diffusion.
+    Denoiser = UniTransformerO2TwoUpdateGeneral (SE(3)-equivariant H<->X updates)
+    Condition:
+      - encoder node embedding (2D-only): cond_node_emb  [N, cond_dim]
+      - encoder graph embedding (CLS token): graph_emb   [B, cond_dim]  (or [N, cond_dim], will be pooled)
+      - time
+    """
+    def __init__(self, config, node_in_dim: int, cond_dim: int):
+        super().__init__()
+        self.config = config
+
+        # ---- diffusion schedule (pos only)
+        if config.beta_schedule == 'cosine':
+            alphas = cosine_beta_schedule(config.num_diffusion_timesteps, config.pos_beta_s) ** 2
+            betas = 1. - alphas
+        else:
+            betas = get_beta_schedule(
+                beta_schedule=config.beta_schedule,
+                beta_start=config.beta_start,
+                beta_end=config.beta_end,
+                num_diffusion_timesteps=config.num_diffusion_timesteps,
+            )
+            alphas = 1. - betas
+
+        alphas_cumprod = np.cumprod(alphas, axis=0)
+        alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+
+        self.betas = to_torch_const(betas)
+        self.num_timesteps = self.betas.size(0)
+
+        self.alphas_cumprod = to_torch_const(alphas_cumprod)
+        self.alphas_cumprod_prev = to_torch_const(alphas_cumprod_prev)
+
+        self.sqrt_alphas_cumprod = to_torch_const(np.sqrt(alphas_cumprod))
+        self.sqrt_one_minus_alphas_cumprod = to_torch_const(np.sqrt(1. - alphas_cumprod))
+
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        self.posterior_mean_c0_coef = to_torch_const(betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        self.posterior_mean_ct_coef = to_torch_const((1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod))
+        self.posterior_var = to_torch_const(posterior_variance)
+        self.posterior_logvar = to_torch_const(np.log(np.append(self.posterior_var[1], self.posterior_var[1:])))
+
+        # ---- model choices
+        self.model_mean_type = config.model_mean_type  # 建议用 'C0'（直接预测 x0）
+        self.sample_time_method = config.sample_time_method  # ['importance','symmetric']
+        self.center_pos_mode = getattr(config, "center_pos_mode", "graph")  # ['none','graph']
+
+        self.hidden_dim = config.hidden_dim
+
+        # ---- time embedding
+        self.time_emb_dim = getattr(config, "time_emb_dim", 64)
+        self.time_emb_mode = getattr(config, "time_emb_mode", "sin")
+
+        if self.time_emb_dim > 0 and self.time_emb_mode == "sin":
+            self.time_emb = nn.Sequential(
+                SinusoidalPosEmb(self.time_emb_dim),
+                nn.Linear(self.time_emb_dim, self.time_emb_dim * 4),
+                nn.GELU(),
+                nn.Linear(self.time_emb_dim * 4, self.time_emb_dim),
+            )
+        else:
+            self.time_emb = None
+
+        # ---- condition projection
+        # node-level condition: cond_node_emb -> hidden
+        self.cond_proj = nn.Linear(cond_dim, self.hidden_dim)
+
+        # graph-level condition: graph_emb -> hidden (维度同 cond_dim)
+        self.graph_proj = nn.Linear(cond_dim, self.hidden_dim)
+
+        # ---- condition fusion: [node_cond, graph_cond(broadcast), time]
+        # fuse_in = self.hidden_dim + self.hidden_dim + (self.time_emb_dim if self.time_emb_dim > 0 else 0)
+        fuse_in = self.hidden_dim + (self.time_emb_dim if self.time_emb_dim > 0 else 0)
+        self.fuse = nn.Sequential(
+            nn.Linear(fuse_in, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+
+        # ---- denoiser (equivariant refine net)
+        self.refine_net_type = config.model_type
+        self.refine_net = get_refine_net(self.refine_net_type, config)
+        
+        self.register_buffer('Lt_history', torch.zeros(self.num_timesteps))
+        self.register_buffer('Lt_count', torch.zeros(self.num_timesteps))
+
+    def _ensure_graph_emb(self, graph_emb: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        """
+        规范 graph_emb 为 [B, cond_dim]：
+        - 若传入是 [B,cond_dim] 直接返回
+        - 若误传成 [N,cond_dim]，用 scatter_mean pool 成 [B,cond_dim]
+        """
+        if graph_emb is None:
+            return None
+        if graph_emb.dim() != 2:
+            raise ValueError(f"graph_emb must be 2D, got shape={tuple(graph_emb.shape)}")
+
+        # 常规：graph_emb already [B, D]
+        num_graphs = int(batch.max().item()) + 1
+        if graph_emb.size(0) == num_graphs:
+            return graph_emb
+
+        # 兼容：graph_emb mistakenly [N, D]
+        if graph_emb.size(0) == batch.size(0):
+            return scatter_mean(graph_emb, batch, dim=0, dim_size=num_graphs)
+
+        raise ValueError(
+            f"graph_emb first dim must be num_graphs={num_graphs} or num_nodes={batch.size(0)}, "
+            f"got {graph_emb.size(0)}"
+        )
+
+    def q_pos_sample(self, x0: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
+        """
+        x_t = sqrt(a_hat) * x0 + sqrt(1-a_hat) * eps
+        """
+        a = self.alphas_cumprod.index_select(0, t)          # [B]
+        a_node = a[batch].unsqueeze(-1)                     # [N,1]
+        eps = torch.randn_like(x0)
+        xt = a_node.sqrt() * x0 + (1. - a_node).sqrt() * eps
+        return xt, eps
+
+    def q_pos_posterior_mean(self, x0: torch.Tensor, xt: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
+        """
+        mean of q(x_{t-1} | x_t, x_0)
+        """
+        return extract(self.posterior_mean_c0_coef, t, batch) * x0 + \
+               extract(self.posterior_mean_ct_coef, t, batch) * xt
+
+    def sample_time(self, num_graphs, device, method):
+        if method == 'importance':
+            # ✅ 修：self.Lt_count 现在存在
+            if not (self.Lt_count > 10).all():
+                return self.sample_time(num_graphs, device, method='symmetric')
+            Lt_sqrt = torch.sqrt(self.Lt_history + 1e-10) + 1e-4
+            Lt_sqrt[0] = Lt_sqrt[1]
+            pt_all = Lt_sqrt / Lt_sqrt.sum()
+            t = torch.multinomial(pt_all, num_samples=num_graphs, replacement=True)
+            pt = pt_all.gather(dim=0, index=t)
+            return t, pt
+
+        if method == 'symmetric':
+            t = torch.randint(0, self.num_timesteps, size=(num_graphs // 2 + 1,), device=device)
+            t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:num_graphs]
+            pt = torch.ones_like(t).float() / self.num_timesteps
+            return t, pt
+
+        raise ValueError(method)
+
+    def forward(
+        self,
+        pos_t,
+        x,
+        batch,
+        cond_node_emb,
+        graph_emb,                 # ✅ NEW
+        time_step,
+        bond_edge_index=None,
+        bond_edge_attr=None,
+        return_all=False,
+        fix_x=False,
+        unconditioned: bool = False,  # ✅ 可选：用于你做 ablation（不用 CFG 也可以不用它）
+    ):
+        """
+        pos_t: [N,3] noisy coords
+        x: [N,node_in_dim] 2D atom feats (no 3D)  (当前没用到，可保留)
+        cond_node_emb: [N,cond_dim] encoder node embeddings
+        graph_emb: [B,cond_dim] encoder CLS embedding (or [N,cond_dim], will be pooled)
+        time_step: [B] long
+        bond_edge_index: [2,E_b]
+        """
+        # ---- normalize graph_emb to [B,cond_dim]
+        graph_emb = self._ensure_graph_emb(graph_emb, batch)  # [B,cond_dim]
+
+        # ---- project node & graph conditions
+        hc_node = self.cond_proj(cond_node_emb)  # [N,H]
+        hg_graph = self.graph_proj(graph_emb)    # [B,H]
+
+        feats = [hc_node]
+
+        # ---- time feature
+        if self.time_emb_dim > 0:
+            if self.time_emb_mode == "sin":
+                t_feat = self.time_emb(time_step)      # [B,Dt]
+                t_feat_node = t_feat[batch]            # [N,Dt]
+            else:
+                t_feat_node = (time_step / self.num_timesteps)[batch].unsqueeze(-1)  # [N,1]
+            feats.append(t_feat_node)
+
+        h0 = self.fuse(torch.cat(feats, dim=-1))  # [N,H]
+
+        # mask: molecule-only => all ones (update all nodes)
+        mask = torch.ones((x.size(0),), device=x.device, dtype=torch.float)
+
+        # ✅ 把 graph_emb 作为全局条件传入 refine_net（与你前面改的 UniTransformer 一致）
+        out = self.refine_net(
+            h0, pos_t, mask, batch,
+            bond_edge_index=bond_edge_index,
+            bond_edge_attr=bond_edge_attr,
+            graph_embedding=hg_graph,      # ✅ NEW
+            unconditioned=unconditioned,    # ✅ 可选
+            return_all=return_all,
+            fix_x=fix_x
+        )
+        return out
+
+    def get_diffusion_loss(self, batch, cond_node_emb, graph_emb, time_step=None):
+        """
+        batch: PyG Batch with .pos .x .edge_index .batch
+        cond_node_emb: [N,cond_dim] encoder output aligned with nodes
+        graph_emb: [B,cond_dim] encoder CLS embedding (or [N,cond_dim], will be pooled)
+        """
+        pos0 = batch.pos
+        x = batch.x
+        bond_edge_index = batch.edge_index
+        bond_edge_attr = batch.edge_attr.float()
+        batch_id = batch.batch
+
+        pos0, offset_per_node, scale_per_node = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
+
+        num_graphs = batch_id.max().item() + 1
+        if time_step is None:
+            t, _ = self.sample_time(num_graphs, pos0.device, self.sample_time_method)
+        else:
+            t = time_step
+
+        pos_t, eps = self.q_pos_sample(pos0, t, batch_id)
+
+        out = self.forward(
+            pos_t=pos_t,
+            x=x,
+            batch=batch_id,
+            cond_node_emb=cond_node_emb,
+            graph_emb=graph_emb,                
+            time_step=t,
+            bond_edge_index=bond_edge_index,
+            bond_edge_attr=bond_edge_attr,
+            return_all=False,
+            fix_x=False,
+            unconditioned=False,
+        )
+        pred = out['x']  # [N,3]
+
+        if self.model_mean_type == 'C0':
+            target = pos0
+            loss_node = ((pred - target) ** 2).sum(-1)  # [N]
+        elif self.model_mean_type == 'noise':
+            target = eps
+            loss_node = ((pred - target) ** 2).sum(-1)
+        else:
+            raise ValueError(self.model_mean_type)
+
+        loss_graph = scatter_mean(loss_node, batch_id, dim=0)  # [B]
+        loss = loss_graph.mean()
+
+        return {
+            "loss": loss,
+            "t": t,
+            "pos0": pos0,
+            "pos_t": pos_t,
+            "pred_x0": pred,
+        }
+
 def extract(coef, t, batch):
     out = coef[t][batch]
     return out.unsqueeze(-1)
 
-# def center_pos_mol(pos: torch.Tensor, batch: torch.Tensor, mode: str = "graph"):
-#     """
-#     把每个图去中心化（平移不变性更稳）。
-#     return: pos_centered, offset_per_node
-#     """
-#     if mode == "none":
-#         offset = torch.zeros((batch.max().item() + 1, 3), device=pos.device, dtype=pos.dtype)
-#         return pos, offset[batch]
-
-#     if mode == "graph":
-#         offset = scatter_mean(pos, batch, dim=0)  # [B,3]
-#         return pos - offset[batch], offset[batch]
-
-#     raise ValueError(mode)
 
 def center_pos_mol(pos: torch.Tensor,
                    batch: torch.Tensor,

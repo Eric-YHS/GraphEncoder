@@ -31,7 +31,7 @@ import utils.misc as misc
 import utils.train as utils_train
 import utils.transforms as trans
 from preprocess import get_pcqm4m_dataset
-from models import GraphGPSEncoder, MolPosDiffusion, GraphGPSEncoder_CLS
+from models import GraphGPSEncoder, MolPosDiffusion, GraphGPSEncoder_CLS, MolPosDiffusion_condition
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -91,7 +91,7 @@ def forward_encoder(encoder: nn.Module, batch):
 
 
 @torch.no_grad()
-def evaluate(encoder, diffusion, loader, device) -> float:
+def evaluate(encoder, diffusion, loader, device, config) -> float:
     encoder.eval()
     diffusion.eval()
 
@@ -100,8 +100,12 @@ def evaluate(encoder, diffusion, loader, device) -> float:
         for b in loader:
             b = _to_device_and_cast(b, device)
             enc_out = forward_encoder(encoder, b)
-            node_emb = _get_node_emb(enc_out)
-            out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None)
+            node_emb, graph_emb = enc_out
+
+            if config.model.model_type == 'uni_o2_condition':
+                out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None, graph_emb=graph_emb)
+            else:
+                out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None)
             losses.append(out["loss"].item())
 
     encoder.train()
@@ -309,12 +313,20 @@ if __name__ == '__main__':
     ).to(device)
 
     # Diffusion (pos-only)
-    diffusion = MolPosDiffusion(
-        config.model,
-        node_in_dim=config.data.node_in_dim,
-        cond_dim=config.encoder.hidden_dim
-    ).to(device)
-
+    if config.model.model_type == 'uni_o2':
+        diffusion = MolPosDiffusion(
+            config.model,
+            node_in_dim=config.data.node_in_dim,
+            cond_dim=config.encoder.hidden_dim
+        ).to(device)
+    elif config.model.model_type == 'uni_o2_condition':
+        diffusion = MolPosDiffusion_condition(
+                    config.model,
+                    node_in_dim=config.data.node_in_dim,
+                    cond_dim=config.encoder.hidden_dim
+                ).to(device)
+    else:
+        raise ValueError("model type error")
     # Optimizer and scheduler
     params = list(encoder.parameters()) + list(diffusion.parameters())
     opt_cfg = config.train.optimizer
@@ -393,7 +405,10 @@ if __name__ == '__main__':
                 enc_out = forward_encoder(encoder, b)
                 node_emb, graph_emb = enc_out
 
-                out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None)
+                if config.model.model_type == 'uni_o2_condition':
+                    out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None, graph_emb=graph_emb)
+                else:
+                    out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None)
                 loss = out["loss"] / acc_steps
                 loss.backward()
                 total_loss += float(out["loss"].item())
@@ -415,7 +430,7 @@ if __name__ == '__main__':
 
             # validation
             if step % val_freq == 0:
-                val_loss = evaluate(encoder, diffusion, val_loader, device)
+                val_loss = evaluate(encoder, diffusion, val_loader, device, config)
                 logger.info(f"[step {step}] val_loss={val_loss:.6f}")
                 writer.add_scalar("val/loss", val_loss, step)
 
