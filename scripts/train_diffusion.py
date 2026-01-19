@@ -31,7 +31,7 @@ import utils.misc as misc
 import utils.train as utils_train
 import utils.transforms as trans
 from preprocess import get_pcqm4m_dataset
-from models import GraphGPSEncoder, MolPosDiffusion
+from models import GraphGPSEncoder, MolPosDiffusion, GraphGPSEncoder_CLS
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -238,8 +238,6 @@ if __name__ == '__main__':
 
     # Logging / dirs
     tag = f"en{config.encoder.num_layers}_de{config.model.num_layers}"
-
-    # ====== [替换] log_dir / ckpt_dir 的生成逻辑：resume 用用户指定的路径 ======
     if args.resume:
         if args.resume_log_dir is None or args.resume_ckpt is None:
             raise ValueError("When --resume, you must provide --resume_log_dir and --resume_ckpt")
@@ -257,23 +255,16 @@ if __name__ == '__main__':
         ckpt_dir = os.path.join('outputs', 'checkpoints', config_name, tag + f"_{ckpt_ts}")
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(ckpt_dir, exist_ok=True)
-    # ========================================================================
 
     vis_dir = os.path.join(log_dir, 'vis')
     os.makedirs(vis_dir, exist_ok=True)
-
-    # ====== [替换] logger / writer：resume 时追加写同一日志文件 & 同一 log_dir 的 TB ======
     logger = setup_logger(log_dir, resume=args.resume, name='train')
-    writer = SummaryWriter(log_dir)  # 指向同一个 log_dir，TensorBoard 会合并显示
-    # ========================================================================
-
+    writer = SummaryWriter(log_dir)
     logger.info(args)
     logger.info(config)
 
-    # ====== [替换] 只在非 resume 时做 copy，避免覆盖/报错 ======
     if not args.resume:
         shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
-        # 若目标存在 copytree 会报错，所以只在新跑时 copy
         shutil.copytree('./models', os.path.join(log_dir, 'models'))
     # ==========================================================
 
@@ -311,7 +302,7 @@ if __name__ == '__main__':
                 f"edge_in_dim={config.data.edge_in_dim}, model.edge_feat_dim={config.model.edge_feat_dim}")
 
     # Encoder
-    encoder = GraphGPSEncoder(
+    encoder = GraphGPSEncoder_CLS(
         config.encoder,
         node_in_dim=config.data.node_in_dim,
         edge_in_dim=config.data.edge_in_dim
