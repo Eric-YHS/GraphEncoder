@@ -51,7 +51,7 @@ def get_refine_net(refine_net_type, config):
             r_max=config.r_max,
             x2h_out_fc=config.x2h_out_fc,
             sync_twoup=config.sync_twoup,
-            graph_cond_dim = config.hidden_dim,
+            graph_cond_dim = config.graph_emb_dim,
         )
     elif refine_net_type == 'egnn':
         refine_net = EGNN(
@@ -498,9 +498,6 @@ class MolPosDiffusion_condition(nn.Module):
         # node-level condition: cond_node_emb -> hidden
         self.cond_proj = nn.Linear(cond_dim, self.hidden_dim)
 
-        # graph-level condition: graph_emb -> hidden (维度同 cond_dim)
-        self.graph_proj = nn.Linear(cond_dim, self.hidden_dim)
-
         # ---- condition fusion: [node_cond, graph_cond(broadcast), time]
         # fuse_in = self.hidden_dim + self.hidden_dim + (self.time_emb_dim if self.time_emb_dim > 0 else 0)
         fuse_in = self.hidden_dim + (self.time_emb_dim if self.time_emb_dim > 0 else 0)
@@ -516,6 +513,10 @@ class MolPosDiffusion_condition(nn.Module):
         
         self.register_buffer('Lt_history', torch.zeros(self.num_timesteps))
         self.register_buffer('Lt_count', torch.zeros(self.num_timesteps))
+
+        # node dropout
+        self.node_dropout = config.node_dropout
+        self.node_dropout_type = getattr(config, "node_dropout_type", "node")
 
     def _ensure_graph_emb(self, graph_emb: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
         """
@@ -606,7 +607,16 @@ class MolPosDiffusion_condition(nn.Module):
 
         # ---- project node & graph conditions
         hc_node = self.cond_proj(cond_node_emb)  # [N,H]
-        hg_graph = self.graph_proj(graph_emb)    # [B,H]
+        
+        if self.training and self.node_dropout > 0:
+            keep_prob = 1.0 - self.node_dropout
+            if self.node_dropout_type in ["node", "both"]:
+                keep_mask = (torch.rand(hc_node.size(0), device=hc_node.device) < keep_prob).float().unsqueeze(-1)
+                # hc = hc * keep_mask / max(keep_prob, 1e-6)
+                hc_node = hc_node * keep_mask
+            
+            if self.node_dropout_type in ["feature", "both"]:
+                hc_node = F.dropout(hc_node, p = self.node_dropout, training=True)
 
         feats = [hc_node]
 
@@ -629,8 +639,8 @@ class MolPosDiffusion_condition(nn.Module):
             h0, pos_t, mask, batch,
             bond_edge_index=bond_edge_index,
             bond_edge_attr=bond_edge_attr,
-            graph_embedding=hg_graph,      # ✅ NEW
-            unconditioned=unconditioned,    # ✅ 可选
+            graph_embedding=graph_emb,
+            unconditioned=unconditioned,
             return_all=return_all,
             fix_x=fix_x
         )
@@ -718,7 +728,6 @@ def center_pos_mol(pos: torch.Tensor,
         return pos, offset[batch], scale[batch]
 
     if mode == "graph":
-        # 1) per-graph 质心
         offset = scatter_mean(pos, batch, dim=0)          # [B,3]
         pos_center = pos - offset[batch]                  # [N,3]
 

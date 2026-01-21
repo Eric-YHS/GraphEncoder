@@ -49,7 +49,7 @@ except Exception:
     multioutput_auroc_score = None
 
 # ====== your encoder import path (as you said) ======
-from models import GraphGPSEncoder
+from models import GraphGPSEncoder, GraphGPSEncoder_CLS
 
 
 # ============================================================
@@ -739,7 +739,8 @@ def run_downstream_from_prepared(
     node_in_dim, edge_in_dim = infer_in_dims_from_dataset(ds)
     log.info(f"Inferred dims: node_in_dim={node_in_dim}, edge_in_dim={edge_in_dim}")
 
-    encoder = GraphGPSEncoder(encoder_cfg, node_in_dim=node_in_dim, edge_in_dim=edge_in_dim).to(device)
+    # encoder = GraphGPSEncoder(encoder_cfg, node_in_dim=node_in_dim, edge_in_dim=edge_in_dim).to(device)
+    encoder = GraphGPSEncoder_CLS(encoder_cfg, node_in_dim=node_in_dim, edge_in_dim=edge_in_dim).to(device)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     encoder.load_state_dict(ckpt["encoder"], strict=True)
     encoder.eval()

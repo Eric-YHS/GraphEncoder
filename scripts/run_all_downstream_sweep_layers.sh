@@ -12,12 +12,12 @@ CKPT_ROOT="outputs/checkpoints/training"
 CKPT_NAME="best.pt"
 
 # ✅ ckpt suffix: tag + "_20260109-180629"
-CKPT_SUFFIX="20260113-101706"
+CKPT_SUFFIX="20260120-164445"
 
 # Sweep: en fixed, de range
 EN=9
-DE_MIN=3
-DE_MAX=6
+DE_MIN=4
+DE_MAX=4
 
 # GPUs: run 2 models in parallel each round (cuda:0-1)
 GPUS=(0 1)

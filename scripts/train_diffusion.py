@@ -274,19 +274,45 @@ if __name__ == '__main__':
 
     # Datasets and loaders
     logger.info('Loading dataset...')
-    ds = Zinc20_3D_LMDBDataset(config.data.path, compressed=False)
-    n = len(ds)
-    logger.info(f"datasets['train'] size (filtered): {n}")
+    if config.data.name == "ZINC":
+        ds = Zinc20_3D_LMDBDataset(config.data.path, compressed=False)
+        n = len(ds)
+        logger.info(f"datasets['train'] size (filtered): {n}")
+        n_train = int(0.9 * n)
+        n_val = int(0.09 * n)
+        n_test = n - n_train - n_val
 
-    n_train = int(0.9 * n)
-    n_val = int(0.09 * n)
-    n_test = n - n_train - n_val
+        train_diff, val_diff, test_diff = random_split(
+            ds,
+            [n_train, n_val, n_test],
+            generator=torch.Generator().manual_seed(2025)
+        )
+    elif config.data.name == "PCQM4M":
 
-    train_diff, val_diff, test_diff = random_split(
-        ds,
-        [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(2025)
-    )
+        datasets = get_pcqm4m_dataset(
+            root=config.data.path,
+            sdf_path=os.path.join(config.data.path, "pcqm4m-v2", "pcqm4m-v2-train.sdf"),
+            build_3d_cache_if_missing=False,
+            mapping_mode="order",
+            max_mols=None,
+            map_size=1 << 40,
+        )
+
+        datasets_diffusion = datasets["train"]
+        n = len(datasets_diffusion)
+        logger.info(f"datasets['train'] size (filtered): {n}")
+
+        n_train = int(0.9 * n)
+        n_val = int(0.09 * n)
+        n_test = n - n_train - n_val
+
+        train_diff, val_diff, test_diff = random_split(
+            datasets_diffusion,
+            [n_train, n_val, n_test],
+            generator=torch.Generator().manual_seed(2025)
+        )
+    else:
+        raise ValueError("dataset name error")
 
     train_loader = DataLoader(train_diff, batch_size=config.train.batch_size, shuffle=True,
                               num_workers=config.train.num_workers, pin_memory=True)
@@ -456,7 +482,7 @@ if __name__ == '__main__':
     # ====================================
 
     # optional: final test eval
-    test_loss = evaluate(encoder, diffusion, test_loader, device)
+    test_loss = evaluate(encoder, diffusion, test_loader, device, config)
     logger.info(f"Final test_loss={test_loss:.6f}")
     writer.add_scalar("test/loss", test_loss, max_iters)
 

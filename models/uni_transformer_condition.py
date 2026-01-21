@@ -43,7 +43,6 @@ class GraphCondEmbedder(nn.Module):
         B = graph_emb.size(0)
         device = graph_emb.device
 
-        # 如果某个图的 graph_emb 含 NaN，当作“缺条件”，强制 drop
         force_drop = torch.isnan(graph_emb).any(dim=-1)  # [B] bool
 
         if unconditioned:
@@ -90,7 +89,7 @@ class BaseX2HAttLayer(nn.Module):
         if self.out_fc:
             self.node_output = MLP(2 * hidden_dim, hidden_dim, hidden_dim, norm=norm, act_fn=act_fn)
 
-        # ✅ NEW: AdaLN style conditioning (GraphDiT-like)
+        # condition
         self.cond_dim = input_dim if cond_dim is None else cond_dim
         self.norm_h = nn.LayerNorm(input_dim, elementwise_affine=False)
         self.adaLN_modulation = nn.Sequential(
@@ -98,15 +97,12 @@ class BaseX2HAttLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(self.cond_dim, 3 * input_dim, bias=True),  # shift, scale, gate (all [N, D])
         )
-        # ✅ GraphDiT/DiT 常用的 zero-init：初始近似恒等，训练更稳
+        
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
     def forward(self, h, r_feat, edge_feat, edge_index, e_w=None, cond_node=None):  # ✅ NEW: cond_node
-        """
-        h: [N, D]
-        cond_node: [N, D] (每个节点对应其所属图的条件向量)
-        """
+        
         N = h.size(0)
         src, dst = edge_index
 
@@ -120,9 +116,9 @@ class BaseX2HAttLayer(nn.Module):
 
         hi, hj = h_mod[dst], h_mod[src]
 
-        kv_input = torch.cat([r_feat, hi, hj], -1)
+        kv_input = torch.cat([r_feat, hi, hj], -1) 
         if edge_feat is not None:
-            kv_input = torch.cat([edge_feat, kv_input], -1)
+            kv_input = torch.cat([edge_feat, kv_input], -1) # [E, r_feat_dim + 2*input_dim + edge_feat_dim]
 
         k = self.hk_func(kv_input).view(-1, self.n_heads, self.output_dim // self.n_heads)
         v = self.hv_func(kv_input)
@@ -145,23 +141,21 @@ class BaseX2HAttLayer(nn.Module):
         output = scatter_sum(m, dst, dim=0, dim_size=N).view(-1, self.output_dim)
 
         if self.out_fc:
-            # 这里 concat 仍用原 h，避免条件改变 residual 分支的“基准”
             msg = self.node_output(torch.cat([output, h], -1))  # [N, D]
         else:
             msg = output
 
-        # ---- ✅ gated residual (GraphDiT-like) ----
         if gate is None:
             h_new = h + msg
         else:
-            h_new = h + gate * msg  # [N, D] elementwise gating
+            h_new = h + gate * msg
 
         return h_new
 
 class BaseH2XAttLayer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, n_heads, edge_feat_dim, r_feat_dim,
                  act_fn='relu', norm=True, ew_net_type='r',
-                 cond_dim=None):  # ✅ NEW
+                 cond_dim=None):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -179,7 +173,7 @@ class BaseH2XAttLayer(nn.Module):
         if ew_net_type == 'r':
             self.ew_net = nn.Sequential(nn.Linear(r_feat_dim, 1), nn.Sigmoid())
 
-        # ✅ NEW: AdaLN for h + scalar gate for delta_x
+
         self.cond_dim = input_dim if cond_dim is None else cond_dim
         self.norm_h = nn.LayerNorm(input_dim, elementwise_affine=False)
         self.adaLN_modulation = nn.Sequential(
@@ -275,10 +269,14 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                                 ew_net_type=self.ew_net_type, cond_dim=hidden_dim)
             )
 
-    def forward(self, h, x, edge_attr, edge_type_feat, edge_index, mask_ligand, e_w=None, fix_x=False, cond_node=None):
+    def forward(self, h, x, 
+                edge_attr,  # cat[edge_type_one_hot, edge_feat], shape=[E_b+E_r, 3+2]
+                edge_type_feat,  # edge_type_feat: edge_type_one_hot, shape=[E_b+E_r, 2]
+                edge_index, # [2, E+b+E_r]
+                mask_ligand, e_w=None, fix_x=False, cond_node=None):
         src, dst = edge_index
         if self.edge_feat_dim > 0:
-            edge_feat = edge_attr  # shape: [#edges_in_batch, #bond_types]
+            edge_feat = edge_attr
         else:
             edge_feat = None
 
@@ -291,7 +289,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
 
         for i in range(self.num_x2h):
             h_out = self.x2h_layers[i](
-                h_in, base_dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=cond_node  # ✅ NEW
+                h_in, base_dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=cond_node
             )
             h_in = h_out
         x2h_out = h_in
@@ -302,7 +300,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             dist_feat = outer_product(edge_type_feat, dist_feat)
 
             delta_x = self.h2x_layers[i](
-                new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=cond_node  # ✅ NEW
+                new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=cond_node
             )
             if not fix_x:
                 x = x + delta_x * mask_ligand[:, None]
@@ -387,9 +385,9 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
     def forward(self, h, x, mask_ligand, batch,
                 bond_edge_index=None,
                 bond_edge_attr=None,
-                graph_embedding=None,      # ✅ NEW: [num_graphs, graph_cond_dim]
-                unconditioned: bool = False,  # ✅ NEW: CFG unconditional branch
-                return_delta: bool = False,   # ✅ NEW: return delta_x for CFG mixing
+                graph_embedding=None,      
+                unconditioned: bool = False, 
+                return_delta: bool = False,
                 return_all=False, fix_x=False):
 
         if bond_edge_attr is not None and bond_edge_index is None:
@@ -457,7 +455,7 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
             for layer in self.base_block:
                 h, x = layer(
                     h, x, edge_attr, edge_type_feat, edge_index, mask_ligand,
-                    e_w=e_w, fix_x=fix_x, cond_node=cond_node  # ✅ NEW
+                    e_w=e_w, fix_x=fix_x, cond_node=cond_node
                 )
 
             all_x.append(x)
@@ -465,7 +463,7 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
 
         outputs = {'x': x, 'h': h}
         if return_delta:
-            outputs['delta_x'] = x - x_in  # ✅ NEW
+            outputs['delta_x'] = x - x_in
         if return_all:
             outputs.update({'all_x': all_x, 'all_h': all_h})
         return outputs

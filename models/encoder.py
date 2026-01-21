@@ -275,13 +275,6 @@ class GraphGPSEncoder(nn.Module):
 
 
 class GraphGlobalSelfAttention_CLS(nn.Module):
-    """
-    对每张图内部做 Multi-Head Self Attention。
-    支持：
-    - padding mask（由 to_dense_batch 生成）
-    - 可选的 SPD bias（spatial_pos），把最短路距离 -> attention bias
-    - 额外的图级 CLS token，作为序列第一个位置参与 self-attn
-    """
     def __init__(
         self,
         hidden_dim: int,
@@ -300,68 +293,69 @@ class GraphGlobalSelfAttention_CLS(nn.Module):
             embed_dim=hidden_dim,
             num_heads=num_heads,
             dropout=attn_dropout,
-            batch_first=True,   # (B, L, D)
+            batch_first=True,
         )
 
-        # Graphormer 风格：SPD -> bias（离散距离 embedding，再映射到每个 head 的 bias）
         if use_spd_bias:
             self.spatial_emb = nn.Embedding(spd_max_dist + 2, num_heads)
-            # dist in [0..spd_max_dist]，其余归为 spd_max_dist+1 (unreachable/too far)
 
     def forward(
         self,
-        h: torch.Tensor,                 # [N, D] 节点表示
+        h: torch.Tensor,                 # [N, D]
         batch: torch.Tensor,             # [N]
-        spatial_pos: Optional[torch.Tensor] = None,  # [B, L, L]（dense，节点间最短路）
-        cls: Optional[torch.Tensor] = None,          # [B, D] 图级 CLS 表征
+        spatial_pos: Optional[torch.Tensor] = None,  # [B, L, L] dense（仅节点）
+        cls: Optional[torch.Tensor] = None,          # [B, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         返回:
-          node_out: [N, D]   更新后的节点表示
-          cls_out:  [B, D]   更新后的 CLS 表征
+          out_cat:  [B, L+1, D]  （包含 CLS + nodes 的 attention 输出）
+          mask:     [B, L]       （原 nodes 的 mask，用于 block 里还原稀疏）
         """
         if cls is None:
-            raise ValueError("GraphGlobalSelfAttention forward() now requires a cls tensor of shape [B, D].")
+            raise ValueError("GraphGlobalSelfAttention forward() requires cls of shape [B, D].")
 
-        # 稀疏 -> dense
-        h_dense, mask = to_dense_batch(h, batch=batch)  # h_dense: [B, L, D], mask: [B, L] True 表示有效节点
+        # sparse -> dense nodes
+        h_dense, mask = to_dense_batch(h, batch=batch)  # [B, L, D], [B, L]
         B, L, D = h_dense.shape
 
         if cls.size(0) != B or cls.size(1) != D:
             raise ValueError(f"cls shape mismatch: got {cls.shape}, expected [{B}, {D}]")
 
-        # 把 CLS 拼到序列最前面
-        cls_tok = cls.unsqueeze(1)              # [B, 1, D]
-        h_cat = torch.cat([cls_tok, h_dense], dim=1)  # [B, L+1, D]
+        # cat = [CLS; nodes]
+        cls_tok = cls.unsqueeze(1)                       # [B,1,D]
+        h_cat = torch.cat([cls_tok, h_dense], dim=1)     # [B,L+1,D]
 
-        # mask：CLS 永远有效，原来的 mask 用于节点
-        cls_mask = h_dense.new_ones(B, 1, dtype=torch.bool)   # [B, 1]
-        mask_cat = torch.cat([cls_mask, mask], dim=1)         # [B, L+1]
-        # key_padding_mask: True 表示要被 mask 掉
-        key_padding_mask = ~mask_cat                          # [B, L+1]
+        # mask: CLS always valid
+        cls_mask = h_dense.new_ones(B, 1, dtype=torch.bool)  # [B,1]
+        mask_cat = torch.cat([cls_mask, mask], dim=1)        # [B,L+1]
+        key_padding_mask = ~mask_cat                         # True=pad
 
         attn_mask = None
         if self.use_spd_bias:
             if spatial_pos is None:
-                raise ValueError("use_spd_bias=True but spatial_pos is None. Please provide batch.spatial_pos_dense.")
+                raise ValueError("use_spd_bias=True but spatial_pos is None.")
 
-            # spatial_pos: [B, L, L] -> 扩展成 [B, L+1, L+1]
-            spd = spatial_pos.clamp(0, self.spd_max_dist + 1)     # [B, L, L]
+            if spatial_pos.shape[:2] != (B, L) or spatial_pos.shape[2] != L:
+                raise ValueError(f"spatial_pos shape mismatch: got {spatial_pos.shape}, expected [{B},{L},{L}]")
+
+            # [B,L,L] -> [B,L+1,L+1]
+            spd = spatial_pos.clamp(0, self.spd_max_dist + 1)
             spd_full = spd.new_full((B, L + 1, L + 1), self.spd_max_dist + 1)
-            # 保留节点-节点之间的最短路
             spd_full[:, 1:, 1:] = spd
-            # CLS 自身距离记为 0
             spd_full[:, 0, 0] = 0
 
-            bias = self.spatial_emb(spd_full)  # [B, L+1, L+1, H]
-            bias = bias.permute(0, 3, 1, 2).contiguous()  # [B, H, L+1, L+1]
+            # ✅ 更合理：CLS 与所有节点距离设为 0（或 1 也行）
+            spd_full[:, 0, 1:] = 0
+            spd_full[:, 1:, 0] = 0
+
+            bias = self.spatial_emb(spd_full)                 # [B,L+1,L+1,H]
+            bias = bias.permute(0, 3, 1, 2).contiguous()      # [B,H,L+1,L+1]
             bias = bias.view(B * self.num_heads, L + 1, L + 1)
 
-            # 把 padding 位置的 bias 设成 -inf
             neg_inf = torch.finfo(h_cat.dtype).min
-            pad2d = key_padding_mask.unsqueeze(1) | key_padding_mask.unsqueeze(2)   # [B, L+1, L+1]
-            pad2d = pad2d.unsqueeze(1).expand(B, self.num_heads, L + 1, L + 1)      # [B, H, L+1, L+1]
-            attn_mask = bias.masked_fill(pad2d.view(B * self.num_heads, L + 1, L + 1), neg_inf)
+            pad2d = key_padding_mask.unsqueeze(1) | key_padding_mask.unsqueeze(2)  # [B,L+1,L+1]
+            pad2d = pad2d.unsqueeze(1).expand(B, self.num_heads, L + 1, L + 1)     # [B,H,L+1,L+1]
+            attn_mask = bias.masked_fill(pad2d.reshape(B * self.num_heads, L + 1, L + 1), neg_inf)
 
         out_cat, _ = self.mha(
             h_cat, h_cat, h_cat,
@@ -370,13 +364,7 @@ class GraphGlobalSelfAttention_CLS(nn.Module):
             need_weights=False,
         )  # [B, L+1, D]
 
-        # 拆回 CLS + 节点
-        cls_out = out_cat[:, 0, :]       # [B, D]
-        node_out_dense = out_cat[:, 1:, :]  # [B, L, D]
-
-        # dense -> 稀疏（只取有效节点）
-        node_out = node_out_dense[mask]  # [N, D]
-        return node_out, cls_out
+        return out_cat, mask
 
 class GraphGPSBlock_CLS(nn.Module):
     def __init__(
@@ -391,8 +379,8 @@ class GraphGPSBlock_CLS(nn.Module):
     ):
         super().__init__()
         self.dropout = dropout
+        self.hidden_dim = hidden_dim
 
-        # Local branch: GINEConv 支持 edge_attr
         nn_local = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -400,7 +388,6 @@ class GraphGPSBlock_CLS(nn.Module):
         )
         self.local_conv = GINEConv(nn_local, edge_dim=edge_dim)
 
-        # Global branch
         self.global_attn = GraphGlobalSelfAttention_CLS(
             hidden_dim=hidden_dim,
             num_heads=num_heads,
@@ -409,7 +396,6 @@ class GraphGPSBlock_CLS(nn.Module):
             spd_max_dist=spd_max_dist,
         )
 
-        # Combine + FFN
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
 
@@ -426,33 +412,53 @@ class GraphGPSBlock_CLS(nn.Module):
         edge_index: torch.Tensor,       # [2, E]
         edge_attr: torch.Tensor,        # [E, edge_dim]
         batch: torch.Tensor,            # [N]
-        spatial_pos: Optional[torch.Tensor] = None,  # [B, L, L]（dense）
+        spatial_pos: Optional[torch.Tensor] = None,  # [B, L, L]（dense nodes）
         cls: Optional[torch.Tensor] = None,          # [B, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        返回:
-          h:   [N, D] 更新后的节点表示
-          cls: [B, D] 更新后的图级 CLS
-        """
-        # local
-        h_local = self.local_conv(h, edge_index, edge_attr)
+
+        if cls is None:
+            raise ValueError("GraphGPSBlock_CLS.forward requires cls [B,D].")
+
+        # ---- local branch (nodes only, sparse)
+        h_local = self.local_conv(h, edge_index, edge_attr)     # [N,D]
         h_local = F.dropout(h_local, p=self.dropout, training=self.training)
 
-        # global (带 CLS)
-        h_global, cls_out = self.global_attn(h, batch=batch, spatial_pos=spatial_pos, cls=cls)
-        h_global = F.dropout(h_global, p=self.dropout, training=self.training)
+        # ---- prepare dense nodes (for cat-level aligned processing)
+        h_dense, mask = to_dense_batch(h, batch=batch)          # [B,L,D], [B,L]
+        h_local_dense, _ = to_dense_batch(h_local, batch=batch) # [B,L,D]
 
-        # residual + norm（节点）
-        h = self.norm1(h + h_local + h_global)
+        B, L, D = h_dense.shape
+        if cls.size(0) != B or cls.size(1) != D:
+            raise ValueError(f"cls shape mismatch: got {cls.shape}, expected [{B},{D}]")
 
-        # ffn（节点）
-        h_ffn = self.ffn(h)
-        h_ffn = F.dropout(h_ffn, p=self.dropout, training=self.training)
-        h = self.norm2(h + h_ffn)
+        # cat_in = [CLS; nodes]
+        cls_tok = cls.unsqueeze(1)                               # [B,1,D]
+        cat_in = torch.cat([cls_tok, h_dense], dim=1)            # [B,L+1,D]
 
-        cls = cls_out
+        # local_cat: CLS 没有 local 分支 => 0；nodes 加 local
+        zeros_cls = h_dense.new_zeros(B, 1, D)                   # [B,1,D]
+        local_cat = torch.cat([zeros_cls, h_local_dense], dim=1) # [B,L+1,D]
 
-        return h, cls
+        # ---- global branch (attention on cat)
+        attn_out_cat, _mask_nodes = self.global_attn(
+            h=h, batch=batch, spatial_pos=spatial_pos, cls=cls
+        )  # [B,L+1,D]
+        attn_out_cat = F.dropout(attn_out_cat, p=self.dropout, training=self.training)
+
+        # ---- ✅ aligned residual + norm (CLS 和 nodes 同构)
+        cat = self.norm1(cat_in + local_cat + attn_out_cat)
+
+        # ---- ✅ aligned FFN + norm
+        cat_ffn = self.ffn(cat)
+        cat_ffn = F.dropout(cat_ffn, p=self.dropout, training=self.training)
+        cat = self.norm2(cat + cat_ffn)
+
+        # ---- split back
+        cls_out = cat[:, 0, :]             # [B,D]
+        node_out_dense = cat[:, 1:, :]     # [B,L,D]
+        h_out = node_out_dense[mask]       # [N,D]
+
+        return h_out, cls_out
 
 class GraphGPSEncoder_CLS(nn.Module):
     def __init__(self, cfg, node_in_dim: int, edge_in_dim: int):
@@ -495,7 +501,7 @@ class GraphGPSEncoder_CLS(nn.Module):
     def forward(self, batch):
         """
         return:
-          node_emb: [N, hidden_dim]
+          node_emb:  [N, hidden_dim]
           graph_emb: [B, hidden_dim]  （图级 CLS 表征）
         """
         x = batch.x
@@ -508,14 +514,17 @@ class GraphGPSEncoder_CLS(nn.Module):
             x = x.long()
         if edge_attr.dtype != torch.long:
             edge_attr = edge_attr.long()
+
         if x.size(-1) != self._expect_node_dim:
             raise ValueError(f"Unexpected node feature dim: got {x.size(-1)}, expect {self._expect_node_dim}")
         if edge_attr.size(-1) != self._expect_edge_dim:
             raise ValueError(f"Unexpected edge feature dim: got {edge_attr.size(-1)}, expect {self._expect_edge_dim}")
 
-        h = self.atom_encoder(x)                 # [N, H]
-        e = self.edge_proj(self.bond_encoder(edge_attr))  # [E, edge_emb_dim]
+        # node / edge encoding
+        h = self.atom_encoder(x)                           # [N, H]
+        e = self.edge_proj(self.bond_encoder(edge_attr))   # [E, edge_emb_dim]
 
+        # degree encoding on nodes
         if self.degree_enc is not None:
             h = h + self.degree_enc(edge_index, num_nodes=N)
 
@@ -523,15 +532,21 @@ class GraphGPSEncoder_CLS(nn.Module):
         if self.cfg.use_spd_bias and spatial_pos_dense is None:
             raise ValueError("cfg.use_spd_bias=True but batch.spatial_pos_dense is missing.")
 
-        # 初始化每张图的 CLS：B = 图的数量
+        # init CLS per graph
         B = int(batch_id.max().item()) + 1
-        cls = self.graph_token.expand(B, -1)   # [B, H]
+        cls = self.graph_token.expand(B, -1).contiguous()  # [B, H]
 
-        # 逐层更新节点 + CLS
+        # stacked blocks
         for blk in self.blocks:
-            h, cls = blk(h, edge_index, e, batch_id, spatial_pos=spatial_pos_dense, cls=cls)
+            h, cls = blk(
+                h=h,
+                edge_index=edge_index,
+                edge_attr=e,
+                batch=batch_id,
+                spatial_pos=spatial_pos_dense,
+                cls=cls,
+            )
 
-        # 最后一层的归一化
         h = self.out_norm(h)
         graph_emb = self.graph_norm(cls)
 

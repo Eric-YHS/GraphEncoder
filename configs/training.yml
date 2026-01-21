@@ -1,7 +1,7 @@
 data:
-  name: ZINC
-  # path: ./data/PCQM4M
-  path: /mnt2/luyifeng/ZINC/zinc20_3d_6000000_k1/zinc_confs.lmdb
+  name: PCQM4M # ZINC/PCQM4M
+  path: ./data/PCQM4M
+  # path: /mnt2/luyifeng/ZINC/zinc20_3d_6000000_k1/zinc_confs.lmdb
   node_in_dim: 9
   edge_in_dim: 3
   
@@ -26,6 +26,7 @@ model:
   sample_time_method: symmetric  # ['importance', 'symmetric']
 
   time_emb_dim: 64
+  graph_emb_dim: 176 # value of graph_emb_dim should be equal to encoder.hidden_dim
   time_emb_mode: sin
   center_pos_mode: graph
 
@@ -40,6 +41,7 @@ model:
   knn: 32 # !
   num_node_types: 8
   act_fn: relu
+
   norm: True
   cutoff_mode: radius
   ew_net_type: r  # [r, m, none]
@@ -48,14 +50,16 @@ model:
   r_max: 1.5
   x2h_out_fc: False
   sync_twoup: False
+  node_dropout: 0.1 # dropout node-wise embedding
+  node_dropout_type: "node" # node/feature/both
 
 train:
   seed: 0
-  batch_size: 256
+  batch_size: 1024
   num_workers: 6
   n_acc_batch: 8
-  max_iters: 105480
-  val_freq: 1318
+  max_iters: 15606
+  val_freq: 390
   pos_noise_std: 0.1
   max_grad_norm: 8.0
   bond_loss_weight: 1.0
