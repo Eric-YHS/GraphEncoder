@@ -31,7 +31,7 @@ import utils.misc as misc
 import utils.train as utils_train
 import utils.transforms as trans
 from preprocess import get_pcqm4m_dataset
-from models import GraphGPSEncoder, MolPosDiffusion, GraphGPSEncoder_CLS, MolPosDiffusion_condition
+from models import GraphGPSEncoder, MolPosDiffusion, GraphGPSEncoder_CLS, MolPosDiffusion_condition, MolPosDiffusion_cat
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -102,7 +102,7 @@ def evaluate(encoder, diffusion, loader, device, config) -> float:
             enc_out = forward_encoder(encoder, b)
             node_emb, graph_emb = enc_out
 
-            if config.model.model_type == 'uni_o2_condition':
+            if config.model.model_type in ['uni_o2_condition', 'uni_o2_cat']:
                 out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None, graph_emb=graph_emb)
             else:
                 out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None)
@@ -351,6 +351,12 @@ if __name__ == '__main__':
                     node_in_dim=config.data.node_in_dim,
                     cond_dim=config.encoder.hidden_dim
                 ).to(device)
+    elif config.model.model_type == 'uni_o2_cat':
+        diffusion = MolPosDiffusion_cat(
+                    config.model,
+                    node_in_dim=config.data.node_in_dim,
+                    cond_dim=config.encoder.hidden_dim
+                ).to(device)
     else:
         raise ValueError("model type error")
     # Optimizer and scheduler
@@ -376,7 +382,6 @@ if __name__ == '__main__':
             verbose=True,
         )
 
-    # ====== [新增] resume：加载 ckpt，恢复 step/best_val/优化器等 ======
     best_val = float("inf")
     start_step = 1
     if args.resume:
@@ -402,7 +407,6 @@ if __name__ == '__main__':
         start_step = last_step + 1
 
         logger.info(f"Resume done: last_step={last_step}, start_step={start_step}, best_val={best_val:.6f}")
-    # ======================================================================
 
     # Train loop
     max_iters = int(config.train.max_iters)
@@ -431,7 +435,7 @@ if __name__ == '__main__':
                 enc_out = forward_encoder(encoder, b)
                 node_emb, graph_emb = enc_out
 
-                if config.model.model_type == 'uni_o2_condition':
+                if config.model.model_type in ['uni_o2_condition', 'uni_o2_cat']:
                     out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None, graph_emb=graph_emb)
                 else:
                     out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None)

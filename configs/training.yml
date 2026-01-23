@@ -31,7 +31,7 @@ model:
   center_pos_mode: graph
 
   node_indicator: True
-  model_type: uni_o2_condition
+  model_type: uni_o2_cat # uni_o2/uni_o2_condition/uni_o2_cat
   num_blocks: 1
   num_layers: 4
   hidden_dim: 128
@@ -47,7 +47,7 @@ model:
   ew_net_type: r  # [r, m, none]
   num_x2h: 1
   num_h2x: 1
-  r_max: 1.5
+  r_max: 10.0
   x2h_out_fc: False
   sync_twoup: False
   node_dropout: 0.1 # dropout node-wise embedding

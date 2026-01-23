@@ -4,6 +4,8 @@ import os
 import subprocess
 import time
 import re
+import sys
+import signal
 from glob import glob
 from collections import deque
 from datetime import datetime
@@ -14,13 +16,11 @@ def parse_list(s):
 
 
 def get_config_name(config_path: str) -> str:
-    # training.yml -> training
     base = os.path.basename(config_path)
     return os.path.splitext(base)[0]
 
 
 def log_ts_to_ckpt_ts(log_ts: str) -> str:
-    # 'YYYY_MM_DD__HH_MM_SS' -> 'YYYYMMDD-HHMMSS'
     m = re.match(r"^(\d{4})_(\d{2})_(\d{2})__(\d{2})_(\d{2})_(\d{2})$", log_ts)
     if not m:
         raise ValueError(f"bad log_ts: {log_ts}")
@@ -29,10 +29,6 @@ def log_ts_to_ckpt_ts(log_ts: str) -> str:
 
 
 def parse_logdir_timestamp(log_run_dir: str, config_name: str, en: int, de: int):
-    """
-    log_run_dir example:
-      logs_diffusion/training_2026_01_13__10_17_06_en9_de6
-    """
     base = os.path.basename(log_run_dir.rstrip("/"))
     pat = re.compile(
         rf"^{re.escape(config_name)}_(\d{{4}}_\d{{2}}_\d{{2}}__\d{{2}}_\d{{2}}_\d{{2}})_en{en}_de{de}$"
@@ -40,11 +36,10 @@ def parse_logdir_timestamp(log_run_dir: str, config_name: str, en: int, de: int)
     m = pat.match(base)
     if not m:
         return None
-    return m.group(1)  # log_ts
+    return m.group(1)
 
 
 def parse_dt_from_log_ts(log_ts: str):
-    # 'YYYY_MM_DD__HH_MM_SS' -> datetime
     m = re.match(r"^(\d{4})_(\d{2})_(\d{2})__(\d{2})_(\d{2})_(\d{2})$", log_ts)
     if not m:
         return None
@@ -53,14 +48,8 @@ def parse_dt_from_log_ts(log_ts: str):
 
 
 def find_latest_log_run(log_root: str, config_name: str, en: int, de: int):
-    """
-    找该 (en,de) 最新的 log run dir：
-      {log_root}/{config_name}_YYYY_MM_DD__HH_MM_SS_en{en}_de{de}
-    """
     pattern = os.path.join(log_root, f"{config_name}_*_en{en}_de{de}")
     candidates = [p for p in glob(pattern) if os.path.isdir(p)]
-    print(pattern)
-    print(candidates)
     if not candidates:
         return None
 
@@ -76,34 +65,84 @@ def find_latest_log_run(log_root: str, config_name: str, en: int, de: int):
 
 
 def build_ckpt_run_from_log_run(ckpt_root: str, config_name: str, en: int, de: int, log_run: str):
-    """
-    给定 log_run，精确构造 ckpt_run：
-      outputs/checkpoints/{config_name}/en{en}_de{de}_{YYYYMMDD-HHMMSS}
-    """
     log_ts = parse_logdir_timestamp(log_run, config_name, en, de)
     if log_ts is None:
         return None
-
     ckpt_ts = log_ts_to_ckpt_ts(log_ts)
     tag = f"en{en}_de{de}"
     ckpt_run = os.path.join(ckpt_root, f"{tag}_{ckpt_ts}")
     return ckpt_run
 
 
+def daemonize(daemon_log: str, pidfile: str = None):
+    """
+    让当前进程脱离终端：关闭 Cursor / 断开 SSH / 关掉集成终端后仍可继续运行
+    - 双 fork
+    - setsid
+    - 忽略 SIGHUP
+    - stdout/stderr 重定向到 daemon_log
+    - 写 pidfile（可选）
+    """
+    if os.name != "posix":
+        raise RuntimeError("--detach 仅支持 Linux/WSL/macOS（posix），Windows 原生不支持 fork。")
+
+    os.makedirs(os.path.dirname(os.path.abspath(daemon_log)) or ".", exist_ok=True)
+
+    # 第一次 fork：让父进程直接退出（这样命令行立刻返回）
+    pid = os.fork()
+    if pid > 0:
+        print(f"[DETACH] 已转入后台。daemon_log={daemon_log}", flush=True)
+        if pidfile:
+            print(f"[DETACH] pidfile={pidfile}（后台进程会写入真实 PID）", flush=True)
+        sys.exit(0)
+
+    # 子进程：成为新会话 leader，脱离控制终端
+    os.setsid()
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    # 第二次 fork：避免未来重新获得控制终端
+    pid2 = os.fork()
+    if pid2 > 0:
+        os._exit(0)
+
+    # 重定向 stdin/stdout/stderr
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    log_fd = os.open(os.path.abspath(daemon_log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+
+    os.dup2(devnull, 0)
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+
+    if devnull > 2:
+        os.close(devnull)
+    if log_fd > 2:
+        os.close(log_fd)
+
+    # 写 pidfile（写当前这个“最终后台进程”的 PID）
+    if pidfile:
+        pidfile_abs = os.path.abspath(pidfile)
+        os.makedirs(os.path.dirname(pidfile_abs) or ".", exist_ok=True)
+        with open(pidfile_abs, "w") as f:
+            f.write(str(os.getpid()))
+            f.write("\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train_script", type=str, default="scripts/train_diffusion.py")
-    ap.add_argument("--config", type=str, required=True)
+    ap.add_argument("--config", type=str, default="configs/training.yml")
     ap.add_argument("--logdir", type=str, default="./logs_diffusion")
-
-    # 你的真实 ckpt 根目录：outputs/checkpoints/training/...
-    # 这里默认自动拼上 config_name
     ap.add_argument("--ckpt_base", type=str, default="./outputs/checkpoints")
-
     ap.add_argument("--gpus", type=str, default="0,1,2,3")
 
+    # ✅ 后台运行相关
+    ap.add_argument("--detach", action="store_true", help="后台运行；关掉 Cursor/终端也能继续")
+    ap.add_argument("--daemon_log", type=str, default="./sweep_daemon.log", help="后台总日志文件")
+    ap.add_argument("--pidfile", type=str, default="./sweep_daemon.pid", help="写入后台 PID 的文件")
+    ap.add_argument("--proc_logdir", type=str, default="./sweep_proc_logs", help="每个(en,de)子进程日志目录")
+
     # resume
-    ap.add_argument("--resume", action="store_true", help="resume each (en,de) by matching log_ts -> ckpt_ts")
+    ap.add_argument("--resume", action="store_true")
     ap.add_argument(
         "--resume_policy",
         type=str,
@@ -125,8 +164,19 @@ def main():
     ap.add_argument("--max_iters", type=int, default=0)
     args = ap.parse_args()
 
-    config_name = get_config_name(args.config)  # training.yml -> training
-    ckpt_root = os.path.join(args.ckpt_base, config_name)  # outputs/checkpoints/training
+    # 建议：保持 cwd 不变（训练脚本/配置里可能依赖相对路径）
+    # 但把日志/脚本路径转成绝对路径，避免重定向/后台后找不到
+    args.daemon_log = os.path.abspath(args.daemon_log)
+    args.pidfile = os.path.abspath(args.pidfile)
+    args.proc_logdir = os.path.abspath(args.proc_logdir)
+
+    if args.detach:
+        daemonize(args.daemon_log, args.pidfile)
+
+    os.makedirs(args.proc_logdir, exist_ok=True)
+
+    config_name = get_config_name(args.config)
+    ckpt_root = os.path.join(args.ckpt_base, config_name)
 
     gpus = parse_list(args.gpus)
     free_gpus = deque(gpus)
@@ -174,13 +224,12 @@ def main():
                 print(msg + " -> START NEW", flush=True)
                 return []
 
-        # ✅ 精确对齐：log_run 的 ts -> ckpt_run 的 ts
         return ["--resume", "--resume_log_dir", log_run, "--resume_ckpt", ckpt_run]
 
     def launch_one(en, de):
         resume_args = maybe_build_resume_args(en, de)
         if resume_args is None:
-            return False  # skip
+            return False
 
         gpu = free_gpus.popleft()
 
@@ -206,12 +255,25 @@ def main():
         if args.max_iters and args.max_iters > 0:
             cmd += ["--max_iters", str(args.max_iters)]
 
-        print(f"[LAUNCH gpu={gpu}] en={en} de={de}\n  {' '.join(cmd)}", flush=True)
-        p = subprocess.Popen(cmd, env=env)
+        run_log = os.path.join(args.proc_logdir, f"en{en}_de{de}_gpu{gpu}.log")
+        print(f"[LAUNCH gpu={gpu}] en={en} de={de}\n  {' '.join(cmd)}\n  -> {run_log}", flush=True)
+
+        # 每个 run 单独日志；并且 start_new_session=True 让子进程不受终端挂断影响
+        log_f = open(run_log, "a", buffering=1)
+        p = subprocess.Popen(
+            cmd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=log_f,
+            start_new_session=True,
+        )
+        # 父进程持有 log_f 句柄没必要；关掉让文件由子进程持有即可
+        log_f.close()
+
         running.append((p, gpu, (en, de)))
         return True
 
-    # 生成组合
     if args.grid:
         enc_lo, enc_hi = [int(x) for x in args.enc_range.split(",")]
         dec_lo, dec_hi = [int(x) for x in args.dec_range.split(",")]
@@ -243,7 +305,7 @@ def main():
                 free_gpus.append(gpu)
         running = still
 
-    print("All sweeps finished.")
+    print("All sweeps finished.", flush=True)
 
 
 if __name__ == "__main__":

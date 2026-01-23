@@ -440,82 +440,7 @@ def multioutput_auroc_from_proba(y_true, y_pred_proba) -> float:
 
     return float(np.mean(scores)) if len(scores) else float("nan")
 
-def proba_to_pos_matrix(y_pred_proba, n_tasks: int) -> np.ndarray:
-    """
-    Convert sklearn predict_proba output to a dense [N, T] matrix of P(y=1).
-    Supports:
-      - list length T: each item (N, Ck)
-      - ndarray (T, N, C)
-      - ndarray (N, 2) for single-task
-      - ndarray (N, T) already positive probs
-      - ndarray (N, 1) (degenerate / single-class) -> treat as 0 for pos prob
-    Always returns float matrix shape [N, n_tasks], padding missing cols with NaN.
-    """
-    try:
-        if isinstance(y_pred_proba, list):
-            # list[t] is (N, C_t)
-            N = np.asarray(y_pred_proba[0]).shape[0]
-            out = np.full((N, n_tasks), np.nan, dtype=float)
-
-            for t in range(min(len(y_pred_proba), n_tasks)):
-                p = np.asarray(y_pred_proba[t])
-                if p.ndim == 2 and p.shape[1] >= 2:
-                    out[:, t] = p[:, 1]
-                elif p.ndim == 2 and p.shape[1] == 1:
-                    # can't know which class; usually means model saw single class
-                    # set pos-prob to 0; AUROC for this task will be 0.5 if labels have both classes
-                    out[:, t] = 0.0
-                elif p.ndim == 1:
-                    out[:, t] = p.astype(float)
-                else:
-                    # unexpected shape -> keep NaN for this task
-                    pass
-            return out
-
-        arr = np.asarray(y_pred_proba)
-
-        # case: (T, N, C)
-        if arr.ndim == 3:
-            # could be (T,N,2) or (N,T,2) depending on how it was packed
-            if arr.shape[0] == n_tasks:
-                # (T,N,C)
-                T, N, C = arr.shape
-                out = np.full((N, n_tasks), np.nan, dtype=float)
-                for t in range(n_tasks):
-                    if C >= 2:
-                        out[:, t] = arr[t, :, 1]
-                    else:
-                        out[:, t] = 0.0
-                return out
-            # if it's (N,T,C)
-            if arr.shape[1] == n_tasks:
-                N, T, C = arr.shape
-                out = np.full((N, n_tasks), np.nan, dtype=float)
-                for t in range(n_tasks):
-                    if C >= 2:
-                        out[:, t] = arr[:, t, 1]
-                    else:
-                        out[:, t] = 0.0
-                return out
-
-        # case: (N,2) single task
-        if arr.ndim == 2 and arr.shape[1] == 2 and n_tasks == 1:
-            return arr[:, 1:2].astype(float)
-
-        # case: already (N,T) positive probs
-        if arr.ndim == 2 and arr.shape[1] == n_tasks:
-            return arr.astype(float)
-
-        # case: (N,1) but multi-task requested -> pad
-        if arr.ndim == 2 and arr.shape[1] == 1:
-            N = arr.shape[0]
-            out = np.full((N, n_tasks), np.nan, dtype=float)
-            out[:, 0] = 0.0
-            return out
-
-    except Exception:
-        pass
-    
+  
 def fallback_multioutput_auroc(y_true: np.ndarray, y_pred_proba) -> float:
     """
     Robust multi-task AUROC:
@@ -577,24 +502,25 @@ def fit_model(X: np.ndarray, y: np.ndarray,
               n_jobs: int = N_JOBS,
               verbosity: int = VERBOSITY):
 
-    if task == "classification":
-        no_outputs = y.shape[1] if len(y.shape) > 1 else 1
-        models = get_clf_models(no_outputs, X.dtype)
-    elif task == "regression":
-        models = get_reg_models(X.dtype)
-    else:
-        raise ValueError(f"Unknown task: {task}")
-
-    if len(y.shape) == 1:
+    if y.ndim == 1:
         y = y.reshape(-1, 1)
 
-    # scorer selection aligned to benchmark train.py
+    # 训练用 y：把 NaN 当成 0（benchmark 里也不会刻意区分这点）
+    y_train = np.nan_to_num(y, nan=0.0)
+
+    # scorer 里我们自己会把 y_true < 0 变成 NaN，再做 AUROC
+    # 如果你担心 NaN 被吃掉，可以直接在 scorer 里复用 y 原始版本，
+    # 但 GridSearchCV 默认用的是 fit 传进来的 y。
+    if task == "classification":
+        no_outputs = y.shape[1] if y.ndim > 1 else 1
+        models = get_clf_models(no_outputs, X.dtype)
+    else:
+        models = get_reg_models(X.dtype)  # 实际不会走到这里
+
     if y.shape[1] > 1:
         scorer = make_scorer(multioutput_auroc_from_proba, response_method="predict_proba")
     else:
         scorer = "roc_auc"
-        
-    y = np.nan_to_num(y, nan=0.0)
 
     model = models[model_head]
     grid_search = GridSearchCV(
@@ -608,7 +534,7 @@ def fit_model(X: np.ndarray, y: np.ndarray,
     )
 
     try:
-        grid_search.fit(X, y)
+        grid_search.fit(X, y_train)
     except ValueError as e:
         # replicate benchmark lbfgs->svd fallback
         log.error(f"Error fitting model {model_head}: {e}")
@@ -630,7 +556,7 @@ def fit_model(X: np.ndarray, y: np.ndarray,
             verbose=verbosity,
             refit=True,
         )
-        grid_search.fit(X, y)
+        grid_search.fit(X, y_train)
 
     return {
         "model": model_head,
@@ -763,7 +689,6 @@ def run_downstream_from_prepared(
         )
 
         y = ds.labels.to_numpy(dtype=float)
-        y = np.nan_to_num(y, nan=0.0)
 
         embedded = EmbeddedDataset(
             name=dataset_name,

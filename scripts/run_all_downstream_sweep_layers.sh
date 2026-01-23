@@ -1,6 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ============================================================
+# Detach wrapper: run this script in background even if terminal closes
+# Usage:
+#   ./downstream_sweep.sh --detach
+#   ./downstream_sweep.sh --detach --daemon_log path --pidfile path
+# Monitor:
+#   tail -f downstream_sweep_daemon.log
+# Stop:
+#   kill -TERM "$(cat downstream_sweep_daemon.pid)"
+# ============================================================
+
+DETACH=0
+DAEMON_LOG="./logs_downstream_sweep_daemon/log"
+PIDFILE="./logs_downstream_sweep_daemon/pid"
+REMAIN_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --detach)
+      DETACH=1
+      shift
+      ;;
+    --daemon_log)
+      DAEMON_LOG="${2:?missing value for --daemon_log}"
+      shift 2
+      ;;
+    --pidfile)
+      PIDFILE="${2:?missing value for --pidfile}"
+      shift 2
+      ;;
+    *)
+      REMAIN_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${REMAIN_ARGS[@]}"
+
+if [[ "${DETACH}" -eq 1 && "${DETACHED:-0}" -eq 0 ]]; then
+  mkdir -p "$(dirname "$DAEMON_LOG")" "$(dirname "$PIDFILE")" 2>/dev/null || true
+  echo "[DETACH] launching in background..."
+  echo "  daemon_log: ${DAEMON_LOG}"
+  echo "  pidfile:    ${PIDFILE}"
+
+  # New session + nohup to ignore SIGHUP. Re-run this script with DETACHED=1.
+  setsid nohup env DETACHED=1 bash "$0" "$@" >>"$DAEMON_LOG" 2>&1 < /dev/null &
+  echo $! > "$PIDFILE"
+  echo "[DETACH] ok. pid=$(cat "$PIDFILE")"
+  exit 0
+fi
+
+# If killed, try to kill the whole process group (safe when detached / job control).
+cleanup() {
+  echo "[SIGNAL] received, terminating process group..."
+  # kill process group of this script (negative pid targets group)
+  kill -- -$$ 2>/dev/null || true
+  exit 1
+}
+trap cleanup INT TERM
+
 # =========================
 # User config
 # =========================
@@ -12,12 +72,12 @@ CKPT_ROOT="outputs/checkpoints/training"
 CKPT_NAME="best.pt"
 
 # ✅ ckpt suffix: tag + "_20260109-180629"
-CKPT_SUFFIX="20260120-164445"
+CKPT_SUFFIX="20260121-191024"
 
 # Sweep: en fixed, de range
 EN=9
 DE_MIN=4
-DE_MAX=4
+DE_MAX=5
 
 # GPUs: run 2 models in parallel each round (cuda:0-1)
 GPUS=(0 1)
