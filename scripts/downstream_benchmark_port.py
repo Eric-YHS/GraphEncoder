@@ -743,7 +743,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prepared_path", type=str, required=True,
                         help="Path to prepared dataset (.json or .joblib), e.g. prepared/DILI.json")
-    parser.add_argument("--ckpt", type=str, required=False, default="./logs_diffusion/training_2025_12_30__14_12_07/checkpoints/best.pt",
+    parser.add_argument("--ckpt", type=str, required=False, default="./outputs/checkpoints/training/en9_de4_20260122-152028/best.pt",
                         help="Path to your training checkpoint best.pt")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--out_dir", type=str, default="./logs_embedding/embedded_cache",
@@ -754,8 +754,8 @@ def main():
                         help="Path to illegal_smiles.txt (optional)")
     parser.add_argument("--override", action="store_true",
                         help="Recompute embeddings even if cached exists")
-    parser.add_argument("--enlayer",default=3)
-    parser.add_argument("--delayer",default=3)
+    parser.add_argument("--enlayer",default=9)
+    parser.add_argument("--delayer",default=4)
     parser.add_argument("--embed_bs", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=8)
 
