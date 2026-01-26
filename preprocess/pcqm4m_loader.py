@@ -332,6 +332,7 @@ class PCQM4Mv2With3D(torch.utils.data.Dataset):
                 raise KeyError(f"3D pos not found in LMDB for idx={idx}")
             pos = _bytes_to_np(blob)  # bytes -> numpy (N,3)
             data.pos = torch.from_numpy(pos)  # 挂到 Data 上（torch.Tensor）
+        data.idx = int(idx)
 
         return data  # 返回 Data（train 有 pos，valid/test 没有）
 
@@ -389,16 +390,21 @@ def _load_or_build_train_idx_with_pos(
 
 def get_pcqm4m_dataset(
     *,
-    root: str,                               # 你的配置：./data/PCQM4M
-    sdf_path: Optional[str] = None,          # 默认会自动指到 root/pcqm4m-v2/pcqm4m-v2-train.sdf
-    cache_dir: Optional[str] = None,         # 默认放到 root/pcqm4m-v2/pos_cache
-    build_3d_cache_if_missing: bool = False, # 第一次运行设 True，会构建 LMDB
-    mapping_mode: str = "auto",              # "auto" | "order" | "inchikey"
+    root: str,
+    sdf_path: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    build_3d_cache_if_missing: bool = False,
+    mapping_mode: str = "auto",
     use_chirality: bool = False,
     sanity_check_k: int = 200,
-    map_size: int = 1 << 40,                 # LMDB 最大容量上限（虚拟，不等于实际占用）
-    max_mols: Optional[int] = None,          # 调试用：例如 10000，先跑通流程
+    map_size: int = 1 << 40,
+    max_mols: Optional[int] = None,
+    # --- SPD cache ---
+    build_spd_cache_if_missing: bool = True,
+    spd_max_dist: int = 8,
+    spd_map_size: int = 1 << 40,
 ) -> Dict[str, Any]:
+
     pcqm_dir = os.path.join(root, "pcqm4m-v2")
 
     if sdf_path is None:
@@ -409,19 +415,21 @@ def get_pcqm4m_dataset(
         cache_dir = os.path.join(pcqm_dir, "pos_cache")
     os.makedirs(cache_dir, exist_ok=True)
 
-    lmdb_path = os.path.join(cache_dir, "pcqm4m_v2_train_pos.lmdb")
+    # -------------------------
+    # (A) 3D pos LMDB
+    # -------------------------
+    pos_lmdb_path = os.path.join(cache_dir, "pcqm4m_v2_train_pos.lmdb")
 
     pyg_dataset = PygPCQM4Mv2Dataset(root=root, smiles2graph=smiles2graph)
     split_idx = pyg_dataset.get_idx_split()
 
-    # 6) 如需要：构建 3D 缓存（仅当 sdf_path 存在且 LMDB 不存在）
-    data_mdb = os.path.join(lmdb_path, "data.mdb")
+    data_mdb = os.path.join(pos_lmdb_path, "data.mdb")
     if sdf_path is not None:
         if (not os.path.exists(data_mdb)) and build_3d_cache_if_missing:
             _build_or_update_3d_lmdb(
                 root=root,
                 sdf_path=sdf_path,
-                lmdb_path=lmdb_path,
+                lmdb_path=pos_lmdb_path,
                 mapping_mode=mapping_mode,
                 use_chirality=use_chirality,
                 sanity_check_k=sanity_check_k,
@@ -429,56 +437,73 @@ def get_pcqm4m_dataset(
                 max_mols=max_mols,
             )
         elif not os.path.exists(data_mdb):
-            # 没缓存也不构建：train 将不带 pos
-            lmdb_path = None
+            pos_lmdb_path = None
     else:
-        # 找不到 sdf：train 将不带 pos
-        lmdb_path = None
+        pos_lmdb_path = None
 
     train_idx = split_idx["train"]
     filtered_train_idx = train_idx
-    if lmdb_path is not None:
+    if pos_lmdb_path is not None:
         filtered_train_idx = _load_or_build_train_idx_with_pos(
             pyg_len=len(pyg_dataset),
             train_idx=np.asarray(train_idx),
-            lmdb_path=lmdb_path,
+            lmdb_path=pos_lmdb_path,
             cache_dir=cache_dir,
             cache_name="train_idx_with_pos.npy",
         )
 
-    # 7) 包装 split：train 带 pos（若 lmdb_path 有效），valid/test 不带
-    train_ds = PCQM4Mv2With3D(pyg_dataset, filtered_train_idx, lmdb_path)
+    # ✅ 只包装 train（你实际会用它，再 random_split）
+    train_ds = PCQM4Mv2With3D(pyg_dataset, filtered_train_idx, pos_lmdb_path)
 
-    # valid/test 仍然按原逻辑（一般不带 3D）
+    # -------------------------
+    # (B) SPD LMDB（只对 filtered_train_idx 建）
+    # -------------------------
+    spd_lmdb_path = None
+    if (pos_lmdb_path is not None) and build_spd_cache_if_missing:
+        spd_lmdb_path = os.path.join(cache_dir, f"pcqm4m_v2_spd_md{spd_max_dist}.lmdb")
+        spd_data_mdb = os.path.join(spd_lmdb_path, "data.mdb")
+
+        if not os.path.exists(spd_data_mdb):
+            from utils.data import build_spd_lmdb  # 你的实现位置
+            # ✅ 只对真正会被训练用到的 idx 构建（filtered_train_idx）
+            idx_list = [int(i) for i in filtered_train_idx]
+            build_spd_lmdb(
+                pyg_dataset=pyg_dataset,
+                indices=idx_list,
+                lmdb_path=spd_lmdb_path,
+                spd_max_dist=int(spd_max_dist),
+                map_size=int(spd_map_size),
+                max_mols=max_mols,   # 你调试时可用
+            )
+    elif (pos_lmdb_path is not None) and (not build_spd_cache_if_missing):
+        # 不构建时，如果你仍然希望走 SPD，就要求它已存在
+        cand = os.path.join(cache_dir, f"pcqm4m_v2_spd_md{spd_max_dist}.lmdb")
+        if os.path.exists(os.path.join(cand, "data.mdb")):
+            spd_lmdb_path = cand
+        else:
+            spd_lmdb_path = None
+
+    # （可选）valid/test 你可以仍然返回，但你说你不使用，完全可以设为 None 省点心
     valid_key = "valid" if "valid" in split_idx else "val"
     valid_ds = PCQM4Mv2With3D(pyg_dataset, split_idx[valid_key], None)
-
-    test_ds = None
-    test_dev_ds = None
-    test_challenge_ds = None
-    if "test" in split_idx:
-        test_ds = PCQM4Mv2With3D(pyg_dataset, split_idx["test"], None)
-    else:
-        if "test-dev" in split_idx:
-            test_dev_ds = PCQM4Mv2With3D(pyg_dataset, split_idx["test-dev"], None)
-        if "test-challenge" in split_idx:
-            test_challenge_ds = PCQM4Mv2With3D(pyg_dataset, split_idx["test-challenge"], None)
+    test_ds = PCQM4Mv2With3D(pyg_dataset, split_idx.get("test", []), None) if "test" in split_idx else None
 
     return {
         "pyg_dataset": pyg_dataset,
         "split_idx": split_idx,
+
         "train": train_ds,
         "valid": valid_ds,
         "test": test_ds,
-        "test-dev": test_dev_ds,
-        "test-challenge": test_challenge_ds,
-        "lmdb_path": lmdb_path,
+
+        "lmdb_path": pos_lmdb_path,
         "sdf_path": sdf_path,
         "cache_dir": cache_dir,
-        "train_idx_with_pos_path": os.path.join(cache_dir, "train_idx_with_pos.npy") if lmdb_path is not None else None,
+        "train_idx_with_pos_path": os.path.join(cache_dir, "train_idx_with_pos.npy") if pos_lmdb_path is not None else None,
         "train_size_before_filter": int(len(train_idx)),
         "train_size_after_filter": int(len(filtered_train_idx)),
+
+        # ✅ NEW: SPD cache info
+        "spd_lmdb_path": spd_lmdb_path,
+        "spd_max_dist": int(spd_max_dist),
     }
-
-
-

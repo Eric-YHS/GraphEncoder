@@ -1,0 +1,1 @@
+python scripts/sweep_layers.py --detach --gpus 3 --dec_range 5,5 --grid

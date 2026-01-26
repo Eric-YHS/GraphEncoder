@@ -385,7 +385,7 @@ class MolPosDiffusion(nn.Module):
         bond_edge_attr = batch.edge_attr.float()
         batch_id = batch.batch
 
-        pos0, offset_per_node = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
+        pos0, _, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
 
         num_graphs = batch_id.max().item() + 1
         if time_step is None:
@@ -656,7 +656,7 @@ class MolPosDiffusion_condition(nn.Module):
         bond_edge_attr = batch.edge_attr.float()
         batch_id = batch.batch
 
-        pos0, offset_per_node = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
+        pos0, _, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
 
         num_graphs = batch_id.max().item() + 1
         if time_step is None:
@@ -910,7 +910,7 @@ class MolPosDiffusion_cat(nn.Module):
         bond_edge_attr = batch.edge_attr.float()
         batch_id = batch.batch
 
-        pos0, offset_per_node, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
+        pos0, _, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
 
         num_graphs = batch_id.max().item() + 1
         if time_step is None:

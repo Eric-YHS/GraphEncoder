@@ -22,16 +22,19 @@ torch.set_num_interop_threads(1)
 
 from sklearn.metrics import roc_auc_score
 from torch.nn.utils import clip_grad_norm_
-from torch_geometric.loader import DataLoader
+from torch.utils.data import DataLoader as TorchDataLoader
 from torch_geometric.transforms import Compose
 from tqdm.auto import tqdm
 from torch.utils.data import random_split
+from functools import partial
 
 import utils.misc as misc
 import utils.train as utils_train
 import utils.transforms as trans
+from utils.data import CollateWithSPDLmdb
 from preprocess import get_pcqm4m_dataset
-from models import GraphGPSEncoder, MolPosDiffusion, GraphGPSEncoder_CLS, MolPosDiffusion_condition, MolPosDiffusion_cat
+from models import GraphGPSEncoder, GraphGPSEncoder_CLS, GraphGPSEncoder_CLS_GraphormerSPD, GraphGPSEncoder_CLS_GPSSPD
+from models import MolPosDiffusion, MolPosDiffusion_condition, MolPosDiffusion_cat
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
@@ -39,6 +42,57 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from ZINC_preprocess import Zinc20_3D_LMDBDataset
 
+def get_encoder(cfg,device):
+    if cfg.name == 'normal':
+        encoder = GraphGPSEncoder(
+            cfg,
+            node_in_dim=config.data.node_in_dim,
+            edge_in_dim=config.data.edge_in_dim
+        ).to(device)
+    elif cfg.name == 'cls':
+        encoder = GraphGPSEncoder_CLS(
+            cfg,
+            node_in_dim=config.data.node_in_dim,
+            edge_in_dim=config.data.edge_in_dim
+        ).to(device)
+    elif cfg.name == 'cls_graphormer':
+        encoder = GraphGPSEncoder_CLS_GraphormerSPD(
+            cfg,
+            node_in_dim=config.data.node_in_dim,
+            edge_in_dim=config.data.edge_in_dim
+        ).to(device)
+    elif cfg.name == 'cls_gps':
+        encoder = GraphGPSEncoder_CLS_GPSSPD(
+            cfg,
+            node_in_dim=config.data.node_in_dim,
+            edge_in_dim=config.data.edge_in_dim
+        ).to(device)
+    else:
+        raise ValueError("encoder name error!")
+    return encoder
+
+def get_diffusion(cfg, device):
+    if cfg.model_type == 'uni_o2':
+        diffusion = MolPosDiffusion(
+            cfg,
+            node_in_dim=config.data.node_in_dim,
+            cond_dim=config.encoder.hidden_dim
+        ).to(device)
+    elif cfg.model_type == 'uni_o2_condition':
+        diffusion = MolPosDiffusion_condition(
+                    cfg,
+                    node_in_dim=config.data.node_in_dim,
+                    cond_dim=config.encoder.hidden_dim
+                ).to(device)
+    elif cfg.model_type == 'uni_o2_cat':
+        diffusion = MolPosDiffusion_cat(
+                    cfg,
+                    node_in_dim=config.data.node_in_dim,
+                    cond_dim=config.encoder.hidden_dim
+                ).to(device)
+    else:
+        raise ValueError("model type error")
+    return diffusion
 
 def update_config(config, batch):
     config.data.node_in_dim = int(batch.x.shape[1])
@@ -205,10 +259,10 @@ def setup_logger(log_dir: str, resume: bool, name: str = "train") -> logging.Log
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--config', type=str, default=None)
+    parser.add_argument('--config', type=str, default='./configs/training.yml')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--logdir', type=str, default='./logs_diffusion')
-    parser.add_argument('--train_report_iter', type=int, default=100)
+    parser.add_argument('--train_report_iter', type=int, default=50)
     parser.add_argument('--encoder_layers', type=int, default=None)
     parser.add_argument('--model_layers', type=int, default=None)
     parser.add_argument('--exp_name', type=str, default='GraphGPS_Encoder')
@@ -241,7 +295,7 @@ if __name__ == '__main__':
         config.model.num_layers = int(args.model_layers)
 
     # Logging / dirs
-    tag = f"en{config.encoder.num_layers}_de{config.model.num_layers}"
+    tag = f"en{config.encoder.num_layers}_de{config.model.num_layers}_e_{config.encoder.name}_d_{config.model.model_type}"
     if args.resume:
         if args.resume_log_dir is None or args.resume_ckpt is None:
             raise ValueError("When --resume, you must provide --resume_log_dir and --resume_ckpt")
@@ -255,7 +309,7 @@ if __name__ == '__main__':
         run_time = time.localtime()
         log_ts  = time.strftime('%Y_%m_%d__%H_%M_%S', run_time)  # 给 log_dir 用
         ckpt_ts = time.strftime('%Y%m%d-%H%M%S', run_time) 
-        log_dir = os.path.join('logs_diffusion', f"{config_name}_{log_ts}_{tag}")
+        log_dir = os.path.join('logs_diffusion', f"{log_ts}_{tag}")
         ckpt_dir = os.path.join('outputs', 'checkpoints', config_name, tag + f"_{ckpt_ts}")
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -296,7 +350,11 @@ if __name__ == '__main__':
             mapping_mode="order",
             max_mols=None,
             map_size=1 << 40,
+            build_spd_cache_if_missing=True,
+            spd_max_dist=int(config.encoder.spd_max_dist),
         )
+        spd_lmdb_path = datasets["spd_lmdb_path"]
+        assert spd_lmdb_path is not None, "spd_lmdb_path is None; SPD cache missing and not built."
 
         datasets_diffusion = datasets["train"]
         n = len(datasets_diffusion)
@@ -314,12 +372,34 @@ if __name__ == '__main__':
     else:
         raise ValueError("dataset name error")
 
-    train_loader = DataLoader(train_diff, batch_size=config.train.batch_size, shuffle=True,
-                              num_workers=config.train.num_workers, pin_memory=True)
-    val_loader   = DataLoader(val_diff,   batch_size=config.train.batch_size, shuffle=True,
-                              num_workers=config.train.num_workers, pin_memory=True)
-    test_loader  = DataLoader(test_diff,  batch_size=config.train.batch_size, shuffle=True,
-                              num_workers=config.train.num_workers, pin_memory=True)
+    collate_fn = CollateWithSPDLmdb(spd_lmdb_path, spd_max_dist=int(config.encoder.spd_max_dist))
+
+    train_loader = TorchDataLoader(
+        train_diff,
+        batch_size=config.train.batch_size,
+        shuffle=True,
+        num_workers=config.train.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    val_loader = TorchDataLoader(
+        val_diff,
+        batch_size=config.train.batch_size,
+        shuffle=False,
+        num_workers=config.train.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    test_loader = TorchDataLoader(
+        test_diff,
+        batch_size=config.train.batch_size,
+        shuffle=False,
+        num_workers=config.train.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
 
     train_iterator = utils_train.inf_iterator(train_loader)
     val_iterator   = utils_train.inf_iterator(val_loader)
@@ -327,47 +407,21 @@ if __name__ == '__main__':
 
     batch0 = next(train_iterator)
     config = update_config(config, batch0)
+    assert hasattr(batch0, "spatial_pos_dense"), "collate_fn 没生效：batch0 没有 spatial_pos_dense"
+    print("spatial_pos_dense:", batch0.spatial_pos_dense.shape, batch0.spatial_pos_dense.dtype)
+    print(batch0.idx[:5] if hasattr(batch0, "idx") else "no idx in batch")
 
     logger.info(f"Auto inferred dims: node_in_dim={config.data.node_in_dim}, "
                 f"edge_in_dim={config.data.edge_in_dim}, model.edge_feat_dim={config.model.edge_feat_dim}")
 
     # Encoder
-    # encoder = GraphGPSEncoder_CLS(
-    #     config.encoder,
-    #     node_in_dim=config.data.node_in_dim,
-    #     edge_in_dim=config.data.edge_in_dim
-    # ).to(device)
-    encoder = GraphGPSEncoder(
-        config.encoder,
-        node_in_dim=config.data.node_in_dim,
-        edge_in_dim=config.data.edge_in_dim
-    ).to(device)
+    encoder = get_encoder(config.encoder, device)
 
     # Diffusion (pos-only)
-    if config.model.model_type == 'uni_o2':
-        diffusion = MolPosDiffusion(
-            config.model,
-            node_in_dim=config.data.node_in_dim,
-            cond_dim=config.encoder.hidden_dim
-        ).to(device)
-    elif config.model.model_type == 'uni_o2_condition':
-        diffusion = MolPosDiffusion_condition(
-                    config.model,
-                    node_in_dim=config.data.node_in_dim,
-                    cond_dim=config.encoder.hidden_dim
-                ).to(device)
-    elif config.model.model_type == 'uni_o2_cat':
-        diffusion = MolPosDiffusion_cat(
-                    config.model,
-                    node_in_dim=config.data.node_in_dim,
-                    cond_dim=config.encoder.hidden_dim
-                ).to(device)
-    else:
-        raise ValueError("model type error")
+    diffusion = get_diffusion(config.model, device)
     # Optimizer and scheduler
     params = list(encoder.parameters()) + list(diffusion.parameters())
     opt_cfg = config.train.optimizer
-
     optimizer = Adam(
         params,
         lr=float(opt_cfg.lr),

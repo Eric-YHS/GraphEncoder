@@ -282,3 +282,175 @@ def parse_sdf_file(path):
         'hybridization': hybridization
     }
     return data
+
+
+# utils/spd_cache.py
+import os
+import lmdb
+import numpy as np
+import torch
+from collections import deque
+from typing import Iterable, Optional
+
+# ========== SPD compute (BFS) ==========
+def compute_spd_matrix(edge_index: torch.Tensor, num_nodes: int, max_dist: int) -> np.ndarray:
+    """
+    返回 uint8 的 SPD 矩阵 [n,n]，值在 [0, max_dist+1]，不可达=max_dist+1。
+    edge_index: [2,E] (局部 0..n-1)
+    """
+    INF = max_dist + 1
+
+    src = edge_index[0].tolist()
+    dst = edge_index[1].tolist()
+
+    adj = [[] for _ in range(num_nodes)]
+    for u, v in zip(src, dst):
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            adj[u].append(v)
+            adj[v].append(u)  # 分子图视为无向
+
+    dist = np.full((num_nodes, num_nodes), INF, dtype=np.uint8)
+    for s in range(num_nodes):
+        dist[s, s] = 0
+        q = deque([s])
+        while q:
+            u = q.popleft()
+            du = int(dist[s, u])
+            if du >= INF:
+                continue
+            nd = du + 1
+            if nd > INF:
+                continue
+            for v in adj[u]:
+                if dist[s, v] > nd:
+                    dist[s, v] = nd
+                    q.append(v)
+    return dist
+
+# ========== LMDB pack/unpack ==========
+def spd_pack(spd_uint8: np.ndarray) -> bytes:
+    """
+    format:
+      uint16 n  (2 bytes, little endian)
+      uint8  spd_flat (n*n bytes)
+    """
+    n = spd_uint8.shape[0]
+    assert spd_uint8.shape == (n, n)
+    header = np.array([n], dtype=np.uint16).tobytes()
+    payload = spd_uint8.reshape(-1).tobytes()
+    return header + payload
+
+def spd_unpack(blob: bytes) -> np.ndarray:
+    n = np.frombuffer(blob[:2], dtype=np.uint16)[0].item()
+    arr = np.frombuffer(blob[2:], dtype=np.uint8)
+    return arr.reshape((n, n))
+
+# ========== Builder ==========
+def build_spd_lmdb(
+    pyg_dataset,
+    indices: Iterable[int],
+    lmdb_path: str,
+    spd_max_dist: int,
+    map_size: int = (1 << 40),
+    max_mols: Optional[int] = None,
+    verbose_every: int = 10000,
+):
+    """
+    读取 pyg_dataset[idx] 的 edge_index / num_nodes，计算 SPD 并写入 LMDB。
+    key = str(idx)
+    """
+    os.makedirs(lmdb_path, exist_ok=True)
+    data_mdb = os.path.join(lmdb_path, "data.mdb")
+    if os.path.exists(data_mdb):
+        print(f"[SPD-LMDB] exists: {data_mdb}, skip build.")
+        return
+
+    env = lmdb.open(
+        lmdb_path,
+        subdir=True,
+        map_size=map_size,
+        readonly=False,
+        lock=True,          # 写入需要 lock
+        readahead=False,
+        meminit=False,
+        max_dbs=1,
+    )
+
+    count = 0
+    with env.begin(write=True) as txn:
+        for k, idx in enumerate(indices):
+            if max_mols is not None and count >= max_mols:
+                break
+
+            data = pyg_dataset[int(idx)]
+            n = int(data.num_nodes)
+            ei = data.edge_index  # [2,E] 全局图内本来就是局部索引
+            if not torch.is_tensor(ei):
+                ei = torch.as_tensor(ei, dtype=torch.long)
+
+            spd = compute_spd_matrix(ei, n, spd_max_dist)  # uint8 [n,n]
+            blob = spd_pack(spd)
+            txn.put(str(int(idx)).encode("utf-8"), blob)
+
+            count += 1
+            if verbose_every and (count % verbose_every == 0):
+                print(f"[SPD-LMDB] built {count} molecules...")
+
+    env.sync()
+    env.close()
+    print(f"[SPD-LMDB] done. total={count} saved at {lmdb_path}")
+
+import lmdb
+import torch
+import numpy as np
+from torch_geometric.data import Batch
+
+class CollateWithSPDLmdb:
+    def __init__(self, spd_lmdb_path: str, spd_max_dist: int):
+        self.spd_lmdb_path = spd_lmdb_path
+        self.spd_max_dist = int(spd_max_dist)
+        self._env = None
+
+    def _get_env(self):
+        if self._env is None:
+            self._env = lmdb.open(
+                self.spd_lmdb_path,
+                subdir=True,
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+                max_dbs=1,
+            )
+        return self._env
+
+    def __call__(self, data_list):
+        # 先做普通 Batch
+        batch = Batch.from_data_list(data_list)
+
+        # 再构造 padded SPD dense
+        sizes = [int(d.num_nodes) for d in data_list]
+        B = len(sizes)
+        L = max(sizes) if B > 0 else 0
+        INF = self.spd_max_dist + 1
+
+        spd_dense = torch.full((B, L, L), INF, dtype=torch.long)
+
+        env = self._get_env()
+        with env.begin(write=False) as txn:
+            for i, d in enumerate(data_list):
+                if not hasattr(d, "idx"):
+                    raise ValueError("Data object missing .idx (global dataset index). Please set data.idx in Dataset.__getitem__.")
+                idx = int(d.idx)
+                blob = txn.get(str(idx).encode("utf-8"))
+                if blob is None:
+                    raise KeyError(f"SPD not found in LMDB for idx={idx}. Did you build the SPD cache?")
+
+                spd = spd_unpack(blob)        # uint8 [n,n]
+                n = spd.shape[0]
+                spd_dense[i, :n, :n] = torch.from_numpy(spd.astype(np.int64))
+
+        batch.spatial_pos_dense = spd_dense
+        return batch
+
+
