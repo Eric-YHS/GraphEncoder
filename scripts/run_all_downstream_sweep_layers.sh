@@ -72,7 +72,7 @@ CKPT_ROOT="outputs/checkpoints/training"
 CKPT_NAME="best.pt"
 
 # ✅ ckpt suffix: tag + "_20260109-180629"
-CKPT_SUFFIX="20260122-152028"
+CKPT_SUFFIX="20260122-160520"
 
 # Sweep: en fixed, de range
 EN=9

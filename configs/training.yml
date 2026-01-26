@@ -47,7 +47,7 @@ model:
   ew_net_type: r  # [r, m, none]
   num_x2h: 1
   num_h2x: 1
-  r_max: 10.0
+  r_max: 1.5          # 1.5/10
   x2h_out_fc: False
   sync_twoup: False
   node_dropout: 0.1 # dropout node-wise embedding
@@ -55,11 +55,11 @@ model:
 
 train:
   seed: 0
-  batch_size: 1024
+  batch_size: 256
   num_workers: 6
   n_acc_batch: 8
-  max_iters: 15606
-  val_freq: 390
+  max_iters: 64000
+  val_freq: 400
   pos_noise_std: 0.1
   max_grad_norm: 8.0
   bond_loss_weight: 1.0

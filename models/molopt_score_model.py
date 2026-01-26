@@ -910,7 +910,7 @@ class MolPosDiffusion_cat(nn.Module):
         bond_edge_attr = batch.edge_attr.float()
         batch_id = batch.batch
 
-        pos0, offset_per_node = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
+        pos0, offset_per_node, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
 
         num_graphs = batch_id.max().item() + 1
         if time_step is None:
@@ -964,7 +964,9 @@ def extract(coef, t, batch):
 
 def center_pos_mol(pos: torch.Tensor,
                    batch: torch.Tensor,
-                   mode: str = "graph"):
+                   mode: str = "graph",
+                   normalize: bool = False,
+                   eps: float = 1e-8):
 
     B = batch.max().item() + 1
 
@@ -975,8 +977,25 @@ def center_pos_mol(pos: torch.Tensor,
 
     if mode == "graph":
         offset = scatter_mean(pos, batch, dim=0)          # [B,3]
-        pos_center = pos - offset[batch]                  # [N,3]
+        pos_center = pos - offset[batch]   
+                       # [N,3]
 
-        return pos_center, offset[batch]
+        # return pos_center, offset[batch]
+
+        # if normalize:
+        #     # 每个节点到质心的平方距离
+        #     dist2 = (pos_center ** 2).sum(dim=-1)             # [N]
+        #     # 按图平均 -> 每个图的均方距离
+        #     mean_dist2 = scatter_mean(dist2, batch, dim=0)    # [B]
+        #     scale = torch.sqrt(mean_dist2 + eps)              # [B]
+
+        #     # 避免 scale 太小（极端情况，单原子）
+        #     scale = torch.clamp(scale, min=eps)
+
+        #     pos_center = pos_center / scale[batch].unsqueeze(-1)  # [N,3]
+        #     return pos_center, offset[batch], scale[batch]
+        # else:
+        scale = torch.ones(B, device=pos.device, dtype=pos.dtype)
+        return pos_center, offset[batch], scale 
 
     raise ValueError(mode)

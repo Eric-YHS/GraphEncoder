@@ -89,3 +89,102 @@
 [RUN] GPU 1 | en9_de5 | ogbg-molbace.json
 [RUN] GPU 0 | en9_de4 | ogbg-molclintox.json
 [RUN] GPU 1 | en9_de5 | ogbg-molbbbp.json
+[RUN] GPU 0 | en9_de4 | ogbg-molhiv.json
+[RUN] GPU 1 | en9_de5 | ogbg-molclintox.json
+[RUN] GPU 1 | en9_de5 | ogbg-molhiv.json
+[RUN] GPU 0 | en9_de4 | ogbg-molmuv.json
+[RUN] GPU 1 | en9_de5 | ogbg-molmuv.json
+[RUN] GPU 0 | en9_de4 | ogbg-molsider.json
+[RUN] GPU 1 | en9_de5 | ogbg-molsider.json
+[RUN] GPU 0 | en9_de4 | ogbg-moltox21.json
+[RUN] GPU 1 | en9_de5 | ogbg-moltox21.json
+[FORCE] GPU 0 | en9_de4 | ogbg-moltoxcast (rerun)
+[RUN] GPU 0 | en9_de4 | ogbg-moltoxcast.json
+[FORCE] GPU 1 | en9_de5 | ogbg-moltoxcast (rerun)
+[RUN] GPU 1 | en9_de5 | ogbg-moltoxcast.json
+[RUN] GPU 1 | en9_de5 | PAMPA_NCATS.json
+[RUN] GPU 0 | en9_de4 | PAMPA_NCATS.json
+[RUN] GPU 1 | en9_de5 | Pgp_Broccatelli.json
+[RUN] GPU 0 | en9_de4 | Pgp_Broccatelli.json
+[RUN] GPU 1 | en9_de5 | SARSCoV2_3CLPro_Diamond.json
+[RUN] GPU 1 | en9_de5 | SARSCoV2_Vitro_Touret.json
+[RUN] GPU 0 | en9_de4 | SARSCoV2_3CLPro_Diamond.json
+[RUN] GPU 0 | en9_de4 | SARSCoV2_Vitro_Touret.json
+[MODEL-DONE] GPU 1 <- en9_de5
+[MODEL-DONE] GPU 0 <- en9_de4
+[DONE] gpu0:en9_de4
+[DONE] gpu1:en9_de5
+[INFO] All model benchmarks finished.
+[DONE] Merged en9_de4 -> logs_embedding/embedded_cache_sweep_layers/en9_de4_2026_0123-102229/ALL_GraphGPS_Encoder_en9_de4_results.csv | files=26
+[DONE] Merged en9_de5 -> logs_embedding/embedded_cache_sweep_layers/en9_de5_2026_0123-102229/ALL_GraphGPS_Encoder_en9_de5_results.csv | files=26
+[INFO] Found 26 datasets under data/prepared
+[INFO] Models: en9_de4 en9_de5
+[INFO] GPUs:   0 1 (run 2 models in parallel per round)
+[INFO] RUN_TS: 2026_0123-175819
+[INFO] CKPT_SUFFIX: 20260122-160520
+[ROUND 1] Launch models 0..1 on GPUs 0 1
+[LAUNCH] gpu0:en9_de4 pid=15519
+[LAUNCH] gpu1:en9_de5 pid=15520
+[MODEL-START] GPU 0 -> en9_de4 | ckpt=outputs/checkpoints/training/en9_de4_20260122-160520/best.pt | out_dir=logs_embedding/embedded_cache_sweep_layers/en9_de4_2026_0123-175819
+[MODEL-START] GPU 1 -> en9_de5 | ckpt=outputs/checkpoints/training/en9_de5_20260122-160520/best.pt | out_dir=logs_embedding/embedded_cache_sweep_layers/en9_de5_2026_0123-175819
+[RUN] GPU 0 | en9_de4 | AMES.json
+[RUN] GPU 1 | en9_de5 | AMES.json
+[RUN] GPU 1 | en9_de5 | Bioavailability_Ma.json
+[RUN] GPU 0 | en9_de4 | Bioavailability_Ma.json
+[RUN] GPU 1 | en9_de5 | CYP1A2_Veith.json
+[RUN] GPU 0 | en9_de4 | CYP1A2_Veith.json
+[RUN] GPU 1 | en9_de5 | CYP2C19_Veith.json
+[RUN] GPU 0 | en9_de4 | CYP2C19_Veith.json
+[RUN] GPU 1 | en9_de5 | CYP2C9_Substrate_CarbonMangels.json
+[RUN] GPU 0 | en9_de4 | CYP2C9_Substrate_CarbonMangels.json
+[RUN] GPU 1 | en9_de5 | CYP2C9_Veith.json
+[RUN] GPU 0 | en9_de4 | CYP2C9_Veith.json
+[RUN] GPU 1 | en9_de5 | CYP2D6_Substrate_CarbonMangels.json
+[RUN] GPU 0 | en9_de4 | CYP2D6_Substrate_CarbonMangels.json
+[RUN] GPU 1 | en9_de5 | CYP2D6_Veith.json
+[RUN] GPU 0 | en9_de4 | CYP2D6_Veith.json
+[RUN] GPU 1 | en9_de5 | CYP3A4_Substrate_CarbonMangels.json
+[RUN] GPU 0 | en9_de4 | CYP3A4_Substrate_CarbonMangels.json
+[RUN] GPU 1 | en9_de5 | CYP3A4_Veith.json
+[RUN] GPU 0 | en9_de4 | CYP3A4_Veith.json
+[RUN] GPU 1 | en9_de5 | DILI.json
+[RUN] GPU 0 | en9_de4 | DILI.json
+[RUN] GPU 1 | en9_de5 | hERG.json
+[RUN] GPU 0 | en9_de4 | hERG.json
+[RUN] GPU 1 | en9_de5 | hERG_Karim.json
+[RUN] GPU 0 | en9_de4 | hERG_Karim.json
+[RUN] GPU 1 | en9_de5 | HIA_Hou.json
+[RUN] GPU 0 | en9_de4 | HIA_Hou.json
+[RUN] GPU 1 | en9_de5 | ogbg-molbace.json
+[RUN] GPU 0 | en9_de4 | ogbg-molbace.json
+[RUN] GPU 1 | en9_de5 | ogbg-molbbbp.json
+[RUN] GPU 0 | en9_de4 | ogbg-molbbbp.json
+[RUN] GPU 1 | en9_de5 | ogbg-molclintox.json
+[RUN] GPU 0 | en9_de4 | ogbg-molclintox.json
+[RUN] GPU 1 | en9_de5 | ogbg-molhiv.json
+[RUN] GPU 0 | en9_de4 | ogbg-molhiv.json
+[RUN] GPU 1 | en9_de5 | ogbg-molmuv.json
+[RUN] GPU 0 | en9_de4 | ogbg-molmuv.json
+[RUN] GPU 1 | en9_de5 | ogbg-molsider.json
+[RUN] GPU 0 | en9_de4 | ogbg-molsider.json
+[RUN] GPU 1 | en9_de5 | ogbg-moltox21.json
+[RUN] GPU 0 | en9_de4 | ogbg-moltox21.json
+[FORCE] GPU 1 | en9_de5 | ogbg-moltoxcast (rerun)
+[RUN] GPU 1 | en9_de5 | ogbg-moltoxcast.json
+[FORCE] GPU 0 | en9_de4 | ogbg-moltoxcast (rerun)
+[RUN] GPU 0 | en9_de4 | ogbg-moltoxcast.json
+[RUN] GPU 0 | en9_de4 | PAMPA_NCATS.json
+[RUN] GPU 1 | en9_de5 | PAMPA_NCATS.json
+[RUN] GPU 0 | en9_de4 | Pgp_Broccatelli.json
+[RUN] GPU 0 | en9_de4 | SARSCoV2_3CLPro_Diamond.json
+[RUN] GPU 1 | en9_de5 | Pgp_Broccatelli.json
+[RUN] GPU 0 | en9_de4 | SARSCoV2_Vitro_Touret.json
+[RUN] GPU 1 | en9_de5 | SARSCoV2_3CLPro_Diamond.json
+[MODEL-DONE] GPU 0 <- en9_de4
+[DONE] gpu0:en9_de4
+[RUN] GPU 1 | en9_de5 | SARSCoV2_Vitro_Touret.json
+[MODEL-DONE] GPU 1 <- en9_de5
+[DONE] gpu1:en9_de5
+[INFO] All model benchmarks finished.
+[DONE] Merged en9_de4 -> logs_embedding/embedded_cache_sweep_layers/en9_de4_2026_0123-175819/ALL_GraphGPS_Encoder_en9_de4_results.csv | files=26
+[DONE] Merged en9_de5 -> logs_embedding/embedded_cache_sweep_layers/en9_de5_2026_0123-175819/ALL_GraphGPS_Encoder_en9_de5_results.csv | files=26

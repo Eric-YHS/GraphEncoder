@@ -29,9 +29,7 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-# -------------------------
-# 2) 结构编码：Degree encoding（2D-only，超轻）
-# -------------------------
+
 class DegreeEncoder(nn.Module):
     """
     把节点 degree (0..max_degree) embedding 成向量加到 node hidden 上。
@@ -47,9 +45,6 @@ class DegreeEncoder(nn.Module):
         return self.emb(deg)
 
 
-# -------------------------
-# 3) Global Attention（图内全局 self-attn，可选 SPD bias）
-# -------------------------
 class GraphGlobalSelfAttention(nn.Module):
     """
     对每张图内部做 Multi-Head Self Attention。
@@ -548,6 +543,7 @@ class GraphGPSEncoder_CLS(nn.Module):
             )
 
         h = self.out_norm(h)
+        # graph_emb = self.graph_norm(cls)
         graph_emb = self.graph_norm(cls)
 
         return h, graph_emb

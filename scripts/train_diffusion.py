@@ -332,7 +332,12 @@ if __name__ == '__main__':
                 f"edge_in_dim={config.data.edge_in_dim}, model.edge_feat_dim={config.model.edge_feat_dim}")
 
     # Encoder
-    encoder = GraphGPSEncoder_CLS(
+    # encoder = GraphGPSEncoder_CLS(
+    #     config.encoder,
+    #     node_in_dim=config.data.node_in_dim,
+    #     edge_in_dim=config.data.edge_in_dim
+    # ).to(device)
+    encoder = GraphGPSEncoder(
         config.encoder,
         node_in_dim=config.data.node_in_dim,
         edge_in_dim=config.data.edge_in_dim
