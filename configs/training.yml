@@ -50,7 +50,7 @@ model:
   ew_net_type: r  # [r, m, none]
   num_x2h: 1
   num_h2x: 1
-  r_max: 1.5          # 1.5/10
+  r_max: 5          # 1.5/ 5 /10
   x2h_out_fc: False
   sync_twoup: False
   node_dropout: 0.1 # dropout node-wise embedding

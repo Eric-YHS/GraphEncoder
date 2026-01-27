@@ -42,7 +42,86 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from ZINC_preprocess import Zinc20_3D_LMDBDataset
 
-def get_encoder(cfg,device):
+def build_datasetLoader(config, logger):
+    logger.info('Loading dataset...')
+    if config.data.name == "ZINC":
+        ds = Zinc20_3D_LMDBDataset(config.data.path, compressed=False)
+        n = len(ds)
+        logger.info(f"datasets['train'] size (filtered): {n}")
+        n_train = int(0.9 * n)
+        n_val = int(0.09 * n)
+        n_test = n - n_train - n_val
+
+        train_diff, val_diff, test_diff = random_split(
+            ds,
+            [n_train, n_val, n_test],
+            generator=torch.Generator().manual_seed(2025)
+        )
+    elif config.data.name == "PCQM4M":
+
+        datasets = get_pcqm4m_dataset(
+            root=config.data.path,
+            sdf_path=os.path.join(config.data.path, "pcqm4m-v2", "pcqm4m-v2-train.sdf"),
+            build_3d_cache_if_missing=False,
+            mapping_mode="order",
+            max_mols=None,
+            map_size=1 << 40,
+            build_spd_cache_if_missing=True,
+            spd_max_dist=int(config.encoder.spd_max_dist),
+        )
+        spd_lmdb_path = datasets["spd_lmdb_path"]
+        assert spd_lmdb_path is not None, "spd_lmdb_path is None; SPD cache missing and not built."
+
+        datasets_diffusion = datasets["train"]
+        n = len(datasets_diffusion)
+        logger.info(f"datasets['train'] size (filtered): {n}")
+
+        n_train = int(0.9 * n)
+        n_val = int(0.09 * n)
+        n_test = n - n_train - n_val
+
+        train_diff, val_diff, test_diff = random_split(
+            datasets_diffusion,
+            [n_train, n_val, n_test],
+            generator=torch.Generator().manual_seed(2025)
+        )
+    else:
+        raise ValueError("dataset name error")
+
+    collate_fn = CollateWithSPDLmdb(spd_lmdb_path, spd_max_dist=int(config.encoder.spd_max_dist))
+    train_loader = TorchDataLoader(
+        train_diff,
+        batch_size=config.train.batch_size,
+        shuffle=True,
+        num_workers=config.train.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    val_loader = TorchDataLoader(
+        val_diff,
+        batch_size=config.train.batch_size,
+        shuffle=False,
+        num_workers=config.train.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    test_loader = TorchDataLoader(
+        test_diff,
+        batch_size=config.train.batch_size,
+        shuffle=False,
+        num_workers=config.train.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    train_iterator = utils_train.inf_iterator(train_loader)
+
+    return train_loader, val_loader, test_loader, train_iterator
+    
+
+def build_encoder(cfg,device):
     if cfg.name == 'normal':
         encoder = GraphGPSEncoder(
             cfg,
@@ -71,7 +150,7 @@ def get_encoder(cfg,device):
         raise ValueError("encoder name error!")
     return encoder
 
-def get_diffusion(cfg, device):
+def build_diffusion(cfg, device):
     if cfg.model_type == 'uni_o2':
         diffusion = MolPosDiffusion(
             cfg,
@@ -94,7 +173,7 @@ def get_diffusion(cfg, device):
         raise ValueError("model type error")
     return diffusion
 
-def update_config(config, batch):
+def update_config(config, batch, args):
     config.data.node_in_dim = int(batch.x.shape[1])
 
     if getattr(batch, "edge_attr", None) is None:
@@ -103,6 +182,15 @@ def update_config(config, batch):
         edge_in_dim = int(batch.edge_attr.shape[1])
     config.data.edge_in_dim = edge_in_dim
     config.model.edge_feat_dim = edge_in_dim + 2
+
+    if args.encoder_layers is not None:
+        config.encoder.num_layers = int(args.encoder_layers)
+    if args.model_layers is not None:
+        config.model.num_layers = int(args.model_layers)
+    if args.encoder_name is not None:
+        config.encoder.name = args.encoder_name
+    if args.denoiser_name is not None:
+        config.model.model_type = args.denoiser_name
 
     return config
 
@@ -266,6 +354,8 @@ if __name__ == '__main__':
     parser.add_argument('--encoder_layers', type=int, default=None)
     parser.add_argument('--model_layers', type=int, default=None)
     parser.add_argument('--exp_name', type=str, default='GraphGPS_Encoder')
+    parser.add_argument('--encoder_name', type=str, default=None)
+    parser.add_argument('--denoiser_name', type=str, default=None)
 
     parser.add_argument('--resume', action='store_true', help='resume from existing log+ckpt')
     parser.add_argument('--resume_log_dir', type=str, default=None, help='existing log_dir to continue writing')
@@ -327,98 +417,28 @@ if __name__ == '__main__':
     # ==========================================================
 
     # Datasets and loaders
-    logger.info('Loading dataset...')
-    if config.data.name == "ZINC":
-        ds = Zinc20_3D_LMDBDataset(config.data.path, compressed=False)
-        n = len(ds)
-        logger.info(f"datasets['train'] size (filtered): {n}")
-        n_train = int(0.9 * n)
-        n_val = int(0.09 * n)
-        n_test = n - n_train - n_val
-
-        train_diff, val_diff, test_diff = random_split(
-            ds,
-            [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(2025)
-        )
-    elif config.data.name == "PCQM4M":
-
-        datasets = get_pcqm4m_dataset(
-            root=config.data.path,
-            sdf_path=os.path.join(config.data.path, "pcqm4m-v2", "pcqm4m-v2-train.sdf"),
-            build_3d_cache_if_missing=False,
-            mapping_mode="order",
-            max_mols=None,
-            map_size=1 << 40,
-            build_spd_cache_if_missing=True,
-            spd_max_dist=int(config.encoder.spd_max_dist),
-        )
-        spd_lmdb_path = datasets["spd_lmdb_path"]
-        assert spd_lmdb_path is not None, "spd_lmdb_path is None; SPD cache missing and not built."
-
-        datasets_diffusion = datasets["train"]
-        n = len(datasets_diffusion)
-        logger.info(f"datasets['train'] size (filtered): {n}")
-
-        n_train = int(0.9 * n)
-        n_val = int(0.09 * n)
-        n_test = n - n_train - n_val
-
-        train_diff, val_diff, test_diff = random_split(
-            datasets_diffusion,
-            [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(2025)
-        )
-    else:
-        raise ValueError("dataset name error")
-
-    collate_fn = CollateWithSPDLmdb(spd_lmdb_path, spd_max_dist=int(config.encoder.spd_max_dist))
-
-    train_loader = TorchDataLoader(
-        train_diff,
-        batch_size=config.train.batch_size,
-        shuffle=True,
-        num_workers=config.train.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
-
-    val_loader = TorchDataLoader(
-        val_diff,
-        batch_size=config.train.batch_size,
-        shuffle=False,
-        num_workers=config.train.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
-
-    test_loader = TorchDataLoader(
-        test_diff,
-        batch_size=config.train.batch_size,
-        shuffle=False,
-        num_workers=config.train.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
-
-    train_iterator = utils_train.inf_iterator(train_loader)
-    val_iterator   = utils_train.inf_iterator(val_loader)
-    test_iterator  = utils_train.inf_iterator(test_loader)
+    train_loader, val_loader, test_loader, train_iterator = build_datasetLoader(config, logger)
 
     batch0 = next(train_iterator)
-    config = update_config(config, batch0)
-    assert hasattr(batch0, "spatial_pos_dense"), "collate_fn 没生效：batch0 没有 spatial_pos_dense"
-    print("spatial_pos_dense:", batch0.spatial_pos_dense.shape, batch0.spatial_pos_dense.dtype)
-    print(batch0.idx[:5] if hasattr(batch0, "idx") else "no idx in batch")
+    config = update_config(config, batch0, args)
+    print(batch0)
+    from torch_geometric.nn import radius_graph
+    pos, b = batch0.pos, batch0.batch
+    N = pos.size(0)
+
+    for r in [3.0, 4.0, 5.0, 6.0, 8.0, 10.0]:
+        ei = radius_graph(pos, r=r, batch=b, loop=False, max_num_neighbors=320)
+        deg = torch.bincount(ei[0], minlength=N).float()
+        print(f"r={r:>4}: E/N={ei.size(1)/N:6.2f}, deg_mean={deg.mean().item():6.2f}, deg_max={deg.max().item():.0f}")
+    input()
 
     logger.info(f"Auto inferred dims: node_in_dim={config.data.node_in_dim}, "
                 f"edge_in_dim={config.data.edge_in_dim}, model.edge_feat_dim={config.model.edge_feat_dim}")
 
     # Encoder
-    encoder = get_encoder(config.encoder, device)
-
+    encoder = build_encoder(config.encoder, device)
     # Diffusion (pos-only)
-    diffusion = get_diffusion(config.model, device)
+    diffusion = build_diffusion(config.model, device)
     # Optimizer and scheduler
     params = list(encoder.parameters()) + list(diffusion.parameters())
     opt_cfg = config.train.optimizer

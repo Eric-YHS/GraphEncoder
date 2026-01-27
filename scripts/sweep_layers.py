@@ -134,6 +134,8 @@ def main():
     ap.add_argument("--logdir", type=str, default="./logs_diffusion")
     ap.add_argument("--ckpt_base", type=str, default="./outputs/checkpoints")
     ap.add_argument("--gpus", type=str, default="0,1,2,3")
+    ap.add_argument('--encoder_name', type=str, default=None)
+    ap.add_argument('--denoiser_name', type=str, default=None)
 
     # ✅ 后台运行相关
     ap.add_argument("--detach", action="store_true", help="后台运行；关掉 Cursor/终端也能继续")
@@ -248,6 +250,8 @@ def main():
             "--device", "cuda:0",
             "--encoder_layers", str(en),
             "--model_layers", str(de),
+            "--encoder_name", args.encoder_name,
+            "--denoiser_name", args.denoiser_name,
         ]
 
         cmd += resume_args

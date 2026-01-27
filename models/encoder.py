@@ -563,46 +563,48 @@ class GraphGlobalSelfAttention_CLS_Graphormer(nn.Module):
             dropout=attn_dropout,
             batch_first=True,
         )
-
-
-        self.spatial_emb = nn.Embedding(spd_max_dist + 2, num_heads, padding_idx=0)
+        self.spatial_emb = nn.Embedding(spd_max_dist + 3, num_heads, padding_idx=0)
+        self.graph_token_virtual_distance = nn.Embedding(1, num_heads)
 
     def forward(
         self,
-        h: torch.Tensor,                 # [N, D]
+        h_dense: torch.Tensor,                 # [B,L,D]
+        mask: torch.Tensor,              # [B,L]
         batch: torch.Tensor,             # [N]
         spatial_pos: torch.Tensor,       # [B, L, L] (SPD indices, 0..spd_max+1)
         cls: torch.Tensor,               # [B, D]
     ):
-        if cls is None:
-            raise ValueError("GraphGlobalSelfAttention_CLS_Graphormer requires cls [B,D].")
-
-        # sparse -> dense
-        h_dense, mask = to_dense_batch(h, batch=batch)  # [B,L,D], [B,L]
         B, L, D = h_dense.shape
 
+        if cls.dim() != 2:
+            raise ValueError(f"cls must be [B,D], got {cls.shape}")
         if cls.size(0) != B or cls.size(1) != D:
             raise ValueError(f"cls shape mismatch: got {cls.shape}, expected [{B},{D}]")
 
-        # [CLS; nodes]
-        cls_tok = cls.unsqueeze(1)                       # [B,1,D]
-        h_cat  = torch.cat([cls_tok, h_dense], dim=1)    # [B,L+1,D]
-
-        # padding mask for tokens: True = pad
-        cls_mask  = h_dense.new_ones(B, 1, dtype=torch.bool)  # CLS 永远有效
-        mask_cat  = torch.cat([cls_mask, mask], dim=1)        # [B,L+1]
-        key_padding_mask = ~mask_cat                          # [B,L+1], True = pad
-
-        if spatial_pos is None:
-            raise ValueError("spatial_pos is None.")
-
-        if spatial_pos.shape[:2] != (B, L) or spatial_pos.shape[2] != L:
+        if spatial_pos.dim() != 3:
+            raise ValueError(f"spatial_pos must be [B,L,L], got {spatial_pos.shape}")
+        if spatial_pos.shape[0] != B or spatial_pos.shape[1] != L or spatial_pos.shape[2] != L:
             raise ValueError(
                 f"spatial_pos shape mismatch: got {spatial_pos.shape}, expected [{B},{L},{L}]"
             )
+        if spatial_pos.dtype != torch.long:
+            spatial_pos = spatial_pos.long()
+
+        # [CLS; nodes]
+        cls_tok = cls.unsqueeze(1)                    # [B,1,D]
+        h_cat = torch.cat([cls_tok, h_dense], dim=1)  # [B,L+1,D]
+
+        # token mask: True=valid token
+        cls_valid = mask.new_ones(B, 1)               # [B,1] CLS always valid
+        tok_valid = torch.cat([cls_valid, mask], dim=1)     # [B,L+1]
+        key_padding_mask = ~tok_valid                       # [B,L+1], True=pad
 
         # spatial_pos: [B,L,L]，值域 0..spd_max+1
         spd = spatial_pos.clamp(0, self.spd_max_dist + 1)
+        spd = spd + 1
+        pair_valid = mask.unsqueeze(1) & mask.unsqueeze(2)  # [B,L,L]
+        spd = spd.masked_fill(~pair_valid, 0)
+
 
         # 扩展 CLS：CLS 行列 SPD=0（不加任何 bias）
         spd_full = spd.new_zeros((B, L + 1, L + 1))       # [B,L+1,L+1]
@@ -611,6 +613,9 @@ class GraphGlobalSelfAttention_CLS_Graphormer(nn.Module):
         # embedding -> per-head bias
         bias = self.spatial_emb(spd_full)                 # [B,L+1,L+1,H]
         bias = bias.permute(0, 3, 1, 2).contiguous()      # [B,H,L+1,L+1]
+        t = self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
+        bias[:, :, 1:, 0] = bias[:, :, 1:, 0] + t   # nodes -> CLS
+        bias[:, :, 0, :]  = bias[:, :, 0, :]  + t   # CLS  -> all (含 CLS->CLS)
         bias = bias.view(B * self.num_heads, L + 1, L + 1)
 
         # 把 pad 的行/列全部设为 -inf
@@ -700,7 +705,8 @@ class GraphGPSBlock_CLS_GraphormerSPD(nn.Module):
 
         # ---- global branch: Graphormer-style SPD bias
         attn_out_cat, _ = self.global_attn(
-            h=h,
+            h_dense=h_dense,
+            mask=mask,
             batch=batch,
             spatial_pos=spatial_pos,
             cls=cls,
@@ -708,6 +714,11 @@ class GraphGPSBlock_CLS_GraphormerSPD(nn.Module):
         attn_out_cat = F.dropout(attn_out_cat, p=self.dropout, training=self.training)
 
         # residual + norm
+        # tok_valid: [B,L+1]，True=valid
+        tok_valid = torch.cat([mask.new_ones(B, 1), mask], dim=1)
+        cat_in = cat_in * tok_valid.unsqueeze(-1)
+        local_cat = local_cat * tok_valid.unsqueeze(-1)
+        attn_out_cat = attn_out_cat * tok_valid.unsqueeze(-1)
         cat = self.norm1(cat_in + local_cat + attn_out_cat)
 
         # FFN + residual + norm
@@ -767,103 +778,12 @@ class GraphGPSEncoder_CLS_GraphormerSPD(nn.Module):
 
         self.spd_max_dist = cfg.spd_max_dist
 
-    # ---------- 最短路径(按 batch) 计算 SPD dense ----------
-    def _compute_spatial_pos_dense(
-        self,
-        edge_index: torch.Tensor,  # [2,E]
-        batch: torch.Tensor,       # [N]
-    ) -> torch.Tensor:
-        """
-        返回 Graphormer 风格的 SPD index：
-          spatial_pos[b, i, j] ∈ {0..spd_max+1}
-          0: padding / unreachable
-          1: self (dist=0)
-          2..spd_max+1: hop = 1..spd_max
-        """
-        device = edge_index.device
-        N = batch.size(0)
-        B = int(batch.max().item()) + 1
-
-        # 使用 to_dense_batch 来固定每个图里节点的顺序
-        idx = torch.arange(N, device=device)
-        idx_dense, mask = to_dense_batch(idx.unsqueeze(-1), batch=batch)  # [B,L,1], [B,L]
-        idx_dense = idx_dense.squeeze(-1)                                  # [B,L]
-        _, L = mask.shape
-
-        spd = idx_dense.new_zeros((B, L, L), dtype=torch.long)            # 全 0（padding）
-
-        for b in range(B):
-            node_ids = idx_dense[b, mask[b]]  # 当前图真实节点的全局 index，shape [Lb]
-            Lb = node_ids.size(0)
-            if Lb == 0:
-                continue
-
-            # global -> local 映射
-            global2local = -torch.ones(N, device=device, dtype=torch.long)
-            global2local[node_ids] = torch.arange(Lb, device=device, dtype=torch.long)
-
-            # 选出属于该图的边
-            edge_mask_b = (batch[edge_index[0]] == b) & (batch[edge_index[1]] == b)
-            ei = edge_index[:, edge_mask_b]          # [2, E_b]
-            if ei.numel() == 0:
-                dist_idx = torch.eye(Lb, device=device, dtype=torch.long) + 1  # diag=1, off=0
-                spd[b, :Lb, :Lb] = dist_idx
-                continue
-
-            src = global2local[ei[0]]    # [E_b]
-            dst = global2local[ei[1]]
-
-            # adjacency list（无向）
-            adj = [[] for _ in range(Lb)]
-            src_list = src.tolist()
-            dst_list = dst.tolist()
-            for s, d in zip(src_list, dst_list):
-                if s < 0 or d < 0:
-                    continue
-                adj[s].append(d)
-                adj[d].append(s)
-
-            INF = self.spd_max_dist + 1
-            dist_mat = torch.full((Lb, Lb), INF, device=device, dtype=torch.long)
-
-            # BFS from each node
-            for u in range(Lb):
-                dist = [-1] * Lb
-                dist[u] = 0
-                q = deque([u])
-                while q:
-                    v = q.popleft()
-                    if dist[v] >= self.spd_max_dist:
-                        continue
-                    for w in adj[v]:
-                        if dist[w] == -1:
-                            dist[w] = dist[v] + 1
-                            q.append(w)
-                for v in range(Lb):
-                    d = dist[v]
-                    if d == -1:
-                        continue
-                    if d > self.spd_max_dist:
-                        d = self.spd_max_dist
-                    dist_mat[u, v] = d
-
-            # d ∈ [0..spd_max] -> index = d+1；INF -> 0
-            dist_idx = dist_mat.clone()
-            unreachable = (dist_idx == INF)
-            dist_idx[unreachable] = -1
-            dist_idx = dist_idx + 1                # -1 -> 0, 0 -> 1, ...
-            dist_idx = dist_idx.clamp(min=0, max=self.spd_max_dist + 1)
-
-            spd[b, :Lb, :Lb] = dist_idx
-
-        return spd  # [B,L,L]
-
     # ---------- forward ----------
     def forward(self, batch):
         """
         return:
           node_emb:  [N, hidden_dim]
-          graph_emb: [B, hidden_dim]  （graph-level CLS）
+          graph_emb: [B, hidden_dim]
         """
         x = batch.x
         edge_index = batch.edge_index
@@ -1011,6 +931,7 @@ class GraphGPSBlock_CLS_GPSStyle(nn.Module):
         batch: torch.Tensor,      # [N]
         cls: torch.Tensor,        # [B,D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
         # local
         h_local = self.local_conv(h, edge_index, edge_attr)
         h_local = F.dropout(h_local, p=self.dropout, training=self.training)
@@ -1020,6 +941,8 @@ class GraphGPSBlock_CLS_GPSStyle(nn.Module):
         h_local_dense, _ = to_dense_batch(h_local, batch=batch)  # [B,L,D]
         B, L, D = h_dense.shape
 
+        if cls.size(0) != B or cls.size(1) != D:
+            raise ValueError(f"cls shape mismatch: got {cls.shape}, expected [{B},{D}]")    
         cls_tok = cls.unsqueeze(1)                                # [B,1,D]
         cat_in = torch.cat([cls_tok, h_dense], dim=1)             # [B,L+1,D]
         zeros_cls = h_dense.new_zeros(B, 1, D)
@@ -1112,7 +1035,7 @@ class GraphGPSEncoder_CLS_GPSSPD(nn.Module):
 
     def _inject_spd_node_se(self, h: torch.Tensor, batch_id: torch.Tensor, spatial_pos_dense: torch.Tensor) -> torch.Tensor:
         """
-        spatial_pos_dense: [B,L,L] (padded with inf=max+1)
+        spatial_pos_dense: [B,L,L] (padded with any value, which will be masked, but value range in [0,spd_inf])
         Return: updated h [N,H] with SE fused.
         """
         device = h.device
