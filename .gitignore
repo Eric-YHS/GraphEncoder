@@ -143,6 +143,7 @@ logs_downstream/
 logs_downstream_sweep/
 logs_downstream_sweep_daemon/
 logs_downstream_sweep_per_gpu/
+logs_downstream_sweep_runs/
 logs_embedding/
 logs_sweep_daemon/
 sweep_daemon.log

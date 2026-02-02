@@ -122,67 +122,60 @@ def build_datasetLoader(config, logger):
     
 
 def build_encoder(cfg,device):
-    if cfg.name == 'normal':
+    cfg_encoder = cfg.encoder
+    if cfg_encoder.name == 'normal':
         encoder = GraphGPSEncoder(
-            cfg,
-            node_in_dim=config.data.node_in_dim,
-            edge_in_dim=config.data.edge_in_dim
+            cfg_encoder,
+            node_in_dim=cfg.data.node_in_dim,
+            edge_in_dim=cfg.data.edge_in_dim
         ).to(device)
-    elif cfg.name == 'cls':
+    elif cfg_encoder.name == 'cls':
         encoder = GraphGPSEncoder_CLS(
-            cfg,
-            node_in_dim=config.data.node_in_dim,
-            edge_in_dim=config.data.edge_in_dim
+            cfg_encoder,
+            node_in_dim=cfg.data.node_in_dim,
+            edge_in_dim=cfg.data.edge_in_dim
         ).to(device)
-    elif cfg.name == 'cls_graphormer':
+    elif cfg_encoder.name == 'cls_graphormer':
         encoder = GraphGPSEncoder_CLS_GraphormerSPD(
-            cfg,
-            node_in_dim=config.data.node_in_dim,
-            edge_in_dim=config.data.edge_in_dim
+            cfg_encoder,
+            node_in_dim=cfg.data.node_in_dim,
+            edge_in_dim=cfg.data.edge_in_dim
         ).to(device)
-    elif cfg.name == 'cls_gps':
+    elif cfg_encoder.name == 'cls_gps':
         encoder = GraphGPSEncoder_CLS_GPSSPD(
-            cfg,
-            node_in_dim=config.data.node_in_dim,
-            edge_in_dim=config.data.edge_in_dim
+            cfg_encoder,
+            node_in_dim=cfg.data.node_in_dim,
+            edge_in_dim=cfg.data.edge_in_dim
         ).to(device)
     else:
         raise ValueError("encoder name error!")
     return encoder
 
 def build_diffusion(cfg, device):
-    if cfg.model_type == 'uni_o2':
+    cfg_model = cfg.model
+    if cfg_model.model_type == 'uni_o2':
         diffusion = MolPosDiffusion(
-            cfg,
-            node_in_dim=config.data.node_in_dim,
-            cond_dim=config.encoder.hidden_dim
-        ).to(device)
-    elif cfg.model_type == 'uni_o2_condition':
+                cfg_model,
+                node_in_dim=cfg.data.node_in_dim,
+                cond_dim=cfg.encoder.hidden_dim
+            ).to(device)
+    elif cfg_model.model_type == 'uni_o2_condition':
         diffusion = MolPosDiffusion_condition(
-                    cfg,
-                    node_in_dim=config.data.node_in_dim,
-                    cond_dim=config.encoder.hidden_dim
+                    cfg_model,
+                    node_in_dim=cfg.data.node_in_dim,
+                    cond_dim=cfg.encoder.hidden_dim
                 ).to(device)
-    elif cfg.model_type == 'uni_o2_cat':
+    elif cfg_model.model_type == 'uni_o2_cat':
         diffusion = MolPosDiffusion_cat(
-                    cfg,
-                    node_in_dim=config.data.node_in_dim,
-                    cond_dim=config.encoder.hidden_dim
+                    cfg_model,
+                    node_in_dim=cfg.data.node_in_dim,
+                    cond_dim=cfg.encoder.hidden_dim
                 ).to(device)
     else:
         raise ValueError("model type error")
     return diffusion
 
-def update_config(config, batch, args):
-    config.data.node_in_dim = int(batch.x.shape[1])
-
-    if getattr(batch, "edge_attr", None) is None:
-        edge_in_dim = 0
-    else:
-        edge_in_dim = int(batch.edge_attr.shape[1])
-    config.data.edge_in_dim = edge_in_dim
-    config.model.edge_feat_dim = edge_in_dim + 2
-
+def update_config_with_args(config, args):
     if args.encoder_layers is not None:
         config.encoder.num_layers = int(args.encoder_layers)
     if args.model_layers is not None:
@@ -191,6 +184,18 @@ def update_config(config, batch, args):
         config.encoder.name = args.encoder_name
     if args.denoiser_name is not None:
         config.model.model_type = args.denoiser_name
+
+    return config
+
+def update_config_with_data(config, batch):
+    config.data.node_in_dim = int(batch.x.shape[1])
+
+    if getattr(batch, "edge_attr", None) is None:
+        edge_in_dim = 0
+    else:
+        edge_in_dim = int(batch.edge_attr.shape[1])
+    config.data.edge_in_dim = edge_in_dim
+    config.model.edge_feat_dim = edge_in_dim + 2
 
     return config
 
@@ -379,10 +384,7 @@ if __name__ == '__main__':
     config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
     misc.seed_all(config.train.seed)
     device = torch.device(args.device)
-    if args.encoder_layers is not None:
-        config.encoder.num_layers = int(args.encoder_layers)
-    if args.model_layers is not None:
-        config.model.num_layers = int(args.model_layers)
+    config = update_config_with_args(config, args)
 
     # Logging / dirs
     tag = f"en{config.encoder.num_layers}_de{config.model.num_layers}_e_{config.encoder.name}_d_{config.model.model_type}"
@@ -414,31 +416,20 @@ if __name__ == '__main__':
     if not args.resume:
         shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
         shutil.copytree('./models', os.path.join(log_dir, 'models'))
-    # ==========================================================
 
     # Datasets and loaders
     train_loader, val_loader, test_loader, train_iterator = build_datasetLoader(config, logger)
 
     batch0 = next(train_iterator)
-    config = update_config(config, batch0, args)
-    print(batch0)
-    from torch_geometric.nn import radius_graph
-    pos, b = batch0.pos, batch0.batch
-    N = pos.size(0)
-
-    for r in [3.0, 4.0, 5.0, 6.0, 8.0, 10.0]:
-        ei = radius_graph(pos, r=r, batch=b, loop=False, max_num_neighbors=320)
-        deg = torch.bincount(ei[0], minlength=N).float()
-        print(f"r={r:>4}: E/N={ei.size(1)/N:6.2f}, deg_mean={deg.mean().item():6.2f}, deg_max={deg.max().item():.0f}")
-    input()
+    config = update_config_with_data(config, batch0)
 
     logger.info(f"Auto inferred dims: node_in_dim={config.data.node_in_dim}, "
                 f"edge_in_dim={config.data.edge_in_dim}, model.edge_feat_dim={config.model.edge_feat_dim}")
 
     # Encoder
-    encoder = build_encoder(config.encoder, device)
+    encoder = build_encoder(config, device)
     # Diffusion (pos-only)
-    diffusion = build_diffusion(config.model, device)
+    diffusion = build_diffusion(config, device)
     # Optimizer and scheduler
     params = list(encoder.parameters()) + list(diffusion.parameters())
     opt_cfg = config.train.optimizer
@@ -458,6 +449,9 @@ if __name__ == '__main__':
             factor=float(sch_cfg.factor),
             patience=int(sch_cfg.patience),
             min_lr=float(sch_cfg.min_lr),
+            threshold=float(getattr(sch_cfg, "threshold", 0.0)),
+            threshold_mode=str(getattr(sch_cfg, "threshold_mode", "rel")),
+            cooldown=int(getattr(sch_cfg, "cooldown", 0)),
             verbose=True,
         )
 

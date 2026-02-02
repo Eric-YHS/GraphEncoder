@@ -11,6 +11,7 @@ import json
 import lmdb
 import zlib
 import base64
+import shutil
 import argparse
 import logging as log
 from dataclasses import dataclass
@@ -51,14 +52,14 @@ except Exception:
     multioutput_auroc_score = None
 
 # ====== your encoder import path (as you said) ======
-from models import GraphGPSEncoder, GraphGPSEncoder_CLS
+from models import GraphGPSEncoder, GraphGPSEncoder_CLS, GraphGPSEncoder_CLS_GPSSPD, GraphGPSEncoder_CLS_GraphormerSPD
 
 
 # ============================================================
 #  Constants (match benchmark const.py)
 # ============================================================
 CV_SPLITS = 5
-N_JOBS = 32
+N_JOBS = 8
 DEFAULT_MEMORY_WEIGHT = 1
 VERBOSITY = 10
 
@@ -323,40 +324,53 @@ def build_spd_lmdb_if_missing(prepared_path: str, ds: Dataset, spd_max_dist: int
     value = zlib(compressed SPD bytes) + 头部记录 shape
     为简单起见，这里把 shape 单独存到 LMDB 的 meta 里。
     """
+    log.info("constructing spd...")
     lmdb_path = get_spd_lmdb_path(prepared_path, spd_max_dist, cache_root)
     data_mdb = os.path.join(lmdb_path, "data.mdb")
     if os.path.exists(data_mdb):
-        return lmdb_path
+        try:
+            env_chk = lmdb.open(lmdb_path, subdir=True, readonly=True, lock=False)
+            with env_chk.begin(write=False) as txn_chk:
+                ok = txn_chk.get(b"0") is not None and txn_chk.get(b"__done__") == b"1"
+            env_chk.close()
+            if ok:
+                return lmdb_path
+        except Exception:
+            pass
+        shutil.rmtree(lmdb_path, ignore_errors=True)
 
     os.makedirs(lmdb_path, exist_ok=True)
     env = lmdb.open(lmdb_path, map_size=map_size, subdir=True, lock=True)
 
     inf = spd_max_dist + 1
-    with env.begin(write=True) as txn:
-        # 写 meta
-        txn.put(b"__meta_spd_max_dist__", str(spd_max_dist).encode("utf-8"))
-
-    # 逐条写
+    txn = env.begin(write=True)
+    txn.put(b"__meta_spd_max_dist__", str(spd_max_dist).encode("utf-8"))
     for i in range(len(ds.data)):
+        if i < 10:
+            log.info("constructing spd for node 0")
+
         g = ds.data.iloc[i]["graph"]
         data = graph_dict_to_pyg_data(g)
 
-        # 确保无向（对最短路更合理；OGB 通常本来就双向，但这里安全处理）
         ei = to_undirected(data.edge_index, num_nodes=data.num_nodes).cpu()
 
         spd = shortest_path_dense_unweighted(data.num_nodes, ei, inf=inf)
-        # clamp 到 inf（理论上 BFS 已经是 inf 填充）
         spd = np.minimum(spd, inf).astype(np.uint16)
 
         blob = _spd_np_to_bytes(spd)
 
-        with env.begin(write=True) as txn:
-            # shape 也存一下，便于读（n 每条不同）
-            txn.put(f"__shape__:{i}".encode("utf-8"), f"{spd.shape[0]}".encode("utf-8"))
-            txn.put(str(i).encode("utf-8"), blob)
+        txn.put(f"__shape__:{i}".encode("utf-8"), f"{spd.shape[0]}".encode("utf-8"))
+        txn.put(str(i).encode("utf-8"), blob)
+        
+        if (i + 1) % 1000 == 0:
+            txn.commit()
+            txn = env.begin(write=True)
 
         if (i + 1) % 5000 == 0:
             print(f"[SPD-LMDB] built {i+1}/{len(ds.data)}")
+    
+    txn.put(b"__done__", b"1")
+    txn.commit()
 
     env.sync()
     env.close()
@@ -462,6 +476,7 @@ def embed_dataset_graph_level(
         spd_max_dist=spd_max_dist,
         cache_root=spd_cache_root,
     )
+    log.info(f"[SPD] lmdb_path={spd_lmdb_path} exists={os.path.exists(os.path.join(spd_lmdb_path,'data.mdb'))}")
 
     collate_fn = CollateWithSPDLmdbDownstream(spd_lmdb_path, spd_max_dist=spd_max_dist)
 
@@ -535,26 +550,26 @@ KNN_REG = {"clf__n_neighbors": np.arange(1, 11, 2)}
 
 def get_clf_models(no_output: int, embeddings_dtype):
     if no_output == 1:
-        lr_clf = LogisticRegression(n_jobs=-1)
+        lr_clf = LogisticRegression(n_jobs=1)
         lr_params = RIDGE_CLF
     else:
-        lr_clf = MultiOutputClassifier(LogisticRegression(n_jobs=-1))
+        lr_clf = MultiOutputClassifier(LogisticRegression(n_jobs=1))
         lr_params = RIDGE__MULTIOUTPUT_CLF
 
     return {
-        "rf": {"model": Pipeline([("clf", RandomForestClassifier(n_jobs=-1))]), "params": RF_CLF.copy()},
+        "rf": {"model": Pipeline([("clf", RandomForestClassifier(n_jobs=1))]), "params": RF_CLF.copy()},
         "ridge": {"model": Pipeline([("scaler", StandardScaler()), ("clf", lr_clf)]), "params": lr_params.copy()},
         "knn": {"model": Pipeline([("scaler", StandardScaler()),
-                                  ("clf", KNeighborsClassifier(n_jobs=-1, metric=get_knn_distance(embeddings_dtype)))]),
+                                  ("clf", KNeighborsClassifier(n_jobs=1, metric=get_knn_distance(embeddings_dtype)))]),
                 "params": KNN_CLF.copy()},
     }
 
 def get_reg_models(embeddings_dtype):
     return {
-        "rf": {"model": Pipeline([("clf", RandomForestRegressor(n_jobs=-1))]), "params": RF_REG.copy()},
+        "rf": {"model": Pipeline([("clf", RandomForestRegressor(n_jobs=1))]), "params": RF_REG.copy()},
         "ridge": {"model": Pipeline([("scaler", StandardScaler()), ("clf", Ridge())]), "params": RIDGE_REG.copy()},
         "knn": {"model": Pipeline([("scaler", StandardScaler()),
-                                  ("clf", KNeighborsRegressor(n_jobs=-1, metric=get_knn_distance(embeddings_dtype)))]),
+                                  ("clf", KNeighborsRegressor(n_jobs=1, metric=get_knn_distance(embeddings_dtype)))]),
                 "params": KNN_REG.copy()},
     }
 
@@ -746,33 +761,167 @@ def auroc_scorer(estimator, X, y_true) -> float:
             continue
     return float(np.mean(scores)) if scores else float("nan")
 
+def fit_and_eval_embedding_per_task(
+    embedded: EmbeddedDataset,
+    model_head: str,
+    memory_weight: int = DEFAULT_MEMORY_WEIGHT,
+    cv_splits: int = CV_SPLITS,
+    n_jobs: int = N_JOBS,
+    verbosity: int = VERBOSITY,
+):
+    X = embedded.X
+    y = embedded.y_np.astype(float)
 
-def fit_model(X: np.ndarray, y: np.ndarray,
-              task: str, model_head: str,
-              memory_weight: int = DEFAULT_MEMORY_WEIGHT,
-              cv_splits: int = CV_SPLITS,
-              n_jobs: int = N_JOBS,
-              verbosity: int = VERBOSITY):
+    # 单任务：复用原逻辑
+    if y.ndim == 1 or (y.ndim == 2 and y.shape[1] == 1):
+        return fit_and_eval_embedding(
+            embedded,
+            model_head=model_head,
+            memory_weight=memory_weight,
+            cv_splits=cv_splits,
+            n_jobs=n_jobs,
+            verbosity=verbosity,
+        )
 
-    if y.ndim == 1:
-        y = y.reshape(-1, 1)
+    # -------- 多任务逐 task --------
+    N, T = y.shape
 
-    # 训练用 y：把 NaN 当成 0（benchmark 里也不会刻意区分这点）
-    y_train = np.nan_to_num(y, nan=0.0)
+    # train+valid 的全局索引
+    trainval_idx = np.asarray(
+        list(embedded.splits["train"]) + list(embedded.splits["valid"]),
+        dtype=int
+    )
 
-    # scorer 里我们自己会把 y_true < 0 变成 NaN，再做 AUROC
-    # 如果你担心 NaN 被吃掉，可以直接在 scorer 里复用 y 原始版本，
-    # 但 GridSearchCV 默认用的是 fit 传进来的 y。
+    # test 子集（注意：X_test/y_test 都是 test 子集视角）
+    X_test, y_test = get_test_data(embedded)
+    y_test = y_test.astype(float)
+    y_test[y_test < 0] = np.nan  # 统一 missing: -1 -> NaN
+
+    N_test = X_test.shape[0]
+
+    # ✅ 关键：预测矩阵必须是 (N_test, T)，否则 te_mask 长度对不上
+    y_pred_pos = np.full((N_test, T), np.nan, dtype=float)
+
+    hyperparams = [None] * T
+    cv_scores, test_scores = [], []
+    skipped = 0
+
+    for t in range(T):
+        # 全局 y 的第 t 个任务
+        y_t = y[:, t].astype(float)
+        y_t[y_t < 0] = np.nan
+
+        # ---- train/valid：只保留该任务有标签的样本（全局索引）----
+        m_all = ~np.isnan(y_t)                      # length N
+        tr_mask = m_all[trainval_idx]              # length len(trainval_idx)
+        tr_idx_t = trainval_idx[tr_mask]           # 全局 index
+
+        # train 端有效性
+        if tr_idx_t.size < 10:
+            skipped += 1
+            continue
+        yt_tr = y_t[tr_idx_t]
+        if np.unique(yt_tr).size < 2:
+            skipped += 1
+            continue
+
+        # ---- test：只在 test 子集内有标签的位置上评估 ----
+        te_mask = ~np.isnan(y_test[:, t])          # length N_test
+        if te_mask.sum() < 2:
+            skipped += 1
+            continue
+        if np.unique(y_test[te_mask, t]).size < 2:
+            skipped += 1
+            continue
+
+        # ---- 拟合（单任务 1D y）----
+        try:
+            best = fit_model(
+                X=X[tr_idx_t],
+                y=y_t[tr_idx_t],   # 1D + 已剔除 NaN
+                task=embedded.task,
+                model_head=model_head,
+                memory_weight=memory_weight,
+                cv_splits=cv_splits,
+                n_jobs=n_jobs,
+                verbosity=verbosity,
+            )
+        except ValueError:
+            skipped += 1
+            continue
+
+        hyperparams[t] = best["best_params"]
+        cv_scores.append(best["best_score"])
+
+        # ---- 预测（只对 test 子集里该任务有标签的样本预测）----
+        proba = best["model_obj"].predict_proba(X_test[te_mask])  # shape (n_labeled_test, 2) usually
+        pos = _pos_proba_from_estimator(best["model_obj"], proba, n_tasks=1)[:, 0]  # (n_labeled_test,)
+
+        # ✅ 关键：写回 y_pred_pos 也必须用 test 子集 mask（长度 N_test）
+        y_pred_pos[te_mask, t] = pos
+
+        test_scores.append(float(roc_auc_score(y_test[te_mask, t], pos)))
+
+    return {
+        "model": model_head,
+        "hyperparams": hyperparams,  # list[T]，可能含 None
+        "cv_metric_name": "roc_auc",
+        "cv_metric": float(np.nanmean(cv_scores)) if cv_scores else float("nan"),
+        "test_metric_name": "roc_auc",
+        "test_metric": float(np.nanmean(test_scores)) if test_scores else float("nan"),
+        "y_test_true": y_test,       # (N_test, T)
+        "y_test_pred": y_pred_pos,   # ✅ (N_test, T)
+        "n_tasks": int(T),
+        "n_tasks_used": int(len(test_scores)),
+        "n_tasks_skipped": int(skipped),
+    }
+
+def fit_model(
+    X: np.ndarray,
+    y: np.ndarray,
+    task: str,
+    model_head: str,
+    memory_weight: int = DEFAULT_MEMORY_WEIGHT,
+    cv_splits: int = CV_SPLITS,
+    n_jobs: int = N_JOBS,
+    verbosity: int = VERBOSITY,
+):
+    # --- normalize y to 1D ---
+    y = np.asarray(y, dtype=float)
+    if y.ndim == 2 and y.shape[1] == 1:
+        y = y[:, 0]
+    if y.ndim != 1:
+        raise ValueError(
+            f"fit_model expects single-task y as 1D. Got shape={y.shape}. "
+            f"For multi-task, split per task and call fit_model per task."
+        )
+
+    # --- treat missing labels ---
+    # 如果你不确定是否存在 -1，可以先不加这一行；
+    # 但加了通常更安全：-1/其他负数当缺失。
+    y_clean = y.copy()
+    y_clean[y_clean < 0] = np.nan
+
+    mask = ~np.isnan(y_clean)
+    X_fit = X[mask]
+    y_fit = y_clean[mask]
+
+    # --- sanity checks ---
+    if X_fit.shape[0] < 10:
+        raise ValueError(f"Too few labeled samples after filtering: {X_fit.shape[0]}")
+
     if task == "classification":
-        no_outputs = y.shape[1] if y.ndim > 1 else 1
-        models = get_clf_models(no_outputs, X.dtype)
-    else:
-        models = get_reg_models(X.dtype)  # 实际不会走到这里
+        # AUROC 需要至少两类
+        if np.unique(y_fit).size < 2:
+            raise ValueError("Only one class present after filtering; AUROC is undefined.")
+        # 单任务分类：让 sklearn 吃 (N,) 并且最好是 int
+        y_fit = y_fit.astype(int)
 
-    if y.shape[1] > 1:
-        scorer = auroc_scorer
-    else:
+        models = get_clf_models(no_output=1, embeddings_dtype=X.dtype)
         scorer = "roc_auc"
+    else:
+        models = get_reg_models(embeddings_dtype=X.dtype)
+        scorer = "neg_mean_squared_error"  
 
     model = models[model_head]
     grid_search = GridSearchCV(
@@ -786,9 +935,8 @@ def fit_model(X: np.ndarray, y: np.ndarray,
     )
 
     try:
-        grid_search.fit(X, y_train)
+        grid_search.fit(X_fit, y_fit)
     except ValueError as e:
-        # replicate benchmark lbfgs->svd fallback
         log.error(f"Error fitting model {model_head}: {e}")
         if "lbfgs" not in str(e):
             raise
@@ -799,6 +947,7 @@ def fit_model(X: np.ndarray, y: np.ndarray,
             model["params"]["clf__solver"] = ["svd"]
         else:
             raise ValueError("Cannot replace solver with SVD; missing solver key in params")
+
         grid_search = GridSearchCV(
             model["model"],
             model["params"],
@@ -808,14 +957,16 @@ def fit_model(X: np.ndarray, y: np.ndarray,
             verbose=verbosity,
             refit=True,
         )
-        grid_search.fit(X, y_train)
+        grid_search.fit(X_fit, y_fit)
 
     return {
         "model": model_head,
         "model_obj": grid_search.best_estimator_,
         "best_params": grid_search.best_params_,
         "best_score": float(grid_search.best_score_),
+        "n_fit": int(X_fit.shape[0]),
     }
+
 
 
 
@@ -834,14 +985,7 @@ def eval_on_test(task: str, y_test: np.ndarray, y_pred_proba) -> float:
 
         # 多任务：需要 [N,T] 形式的正类概率
         if n_tasks > 1:
-            proba_pos = proba_to_pos_matrix(y_pred_proba, n_tasks=n_tasks)  # [N,T]
-
-            if _HAS_SKFP:
-                # skfp 的 multioutput_auroc_score 期望 y_true/y_pred 同形状 [N,T]
-                return float(multioutput_auroc_score(y_test_, proba_pos))
-            else:
-                # 你原来的 fallback 如果是吃 list[(N,2)]，这里也可以改成吃 [N,T]
-                return float(fallback_multioutput_auroc(y_test_, proba_pos))
+            return float(fallback_multioutput_auroc(y_test_, y_pred_proba))
 
         # 单任务
         if isinstance(y_pred_proba, list):
@@ -895,6 +1039,36 @@ def fit_and_eval_embedding(dataset: EmbeddedDataset,
 # ============================================================
 #  Main procedure (prepared -> embed cache -> score heads)
 # ============================================================
+
+def build_encoder(cfg,device, node_in_dim, edge_in_dim):
+    if cfg.name == 'normal':
+        encoder = GraphGPSEncoder(
+            cfg,
+            node_in_dim=node_in_dim,
+            edge_in_dim=edge_in_dim
+        ).to(device)
+    elif cfg.name == 'cls':
+        encoder = GraphGPSEncoder_CLS(
+            cfg,
+            node_in_dim=node_in_dim,
+            edge_in_dim=edge_in_dim
+        ).to(device)
+    elif cfg.name == 'cls_graphormer':
+        encoder = GraphGPSEncoder_CLS_GraphormerSPD(
+            cfg,
+            node_in_dim=node_in_dim,
+            edge_in_dim=edge_in_dim
+        ).to(device)
+    elif cfg.name == 'cls_gps':
+        encoder = GraphGPSEncoder_CLS_GPSSPD(
+            cfg,
+            node_in_dim=node_in_dim,
+            edge_in_dim=edge_in_dim
+        ).to(device)
+    else:
+        raise ValueError("encoder name error!")
+    return encoder
+
 def run_downstream_from_prepared(
     prepared_path: str,
     ckpt_path: str,
@@ -918,10 +1092,12 @@ def run_downstream_from_prepared(
     log.info(f"Inferred dims: node_in_dim={node_in_dim}, edge_in_dim={edge_in_dim}")
 
     # encoder = GraphGPSEncoder(encoder_cfg, node_in_dim=node_in_dim, edge_in_dim=edge_in_dim).to(device)
-    encoder = GraphGPSEncoder_CLS(encoder_cfg, node_in_dim=node_in_dim, edge_in_dim=edge_in_dim).to(device)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    encoder = build_encoder(encoder_cfg, device, node_in_dim, edge_in_dim)
+    ckpt = torch.load(ckpt_path, map_location="cpu",weights_only=True)
     encoder.load_state_dict(ckpt["encoder"], strict=True)
     encoder.eval()
+    log.info(f"Load encoder finished")
+
 
     # 3) embedding cache path (benchmark style)
     save_dir = os.path.join(out_dir, dataset_name)
@@ -932,6 +1108,7 @@ def run_downstream_from_prepared(
         embedded: EmbeddedDataset = joblib.load(embedded_path)
         log.info(f"Loaded cached embeddings: {embedded_path}")
     else:
+        log.info(f"create emb...")
         X = embed_dataset_graph_level(
             encoder=encoder,
             ds=ds,
@@ -959,7 +1136,7 @@ def run_downstream_from_prepared(
     results = []
     for head in AVAILABLE_HEADS:
         log.info(f"Training head={head} on dataset={dataset_name}, embedder={model_name}")
-        res = fit_and_eval_embedding(embedded, model_head=head)
+        res = fit_and_eval_embedding_per_task(embedded, model_head=head)
         res_row = {
             "dataset": dataset_name,
             "task": embedded.task,
@@ -997,7 +1174,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prepared_path", type=str, required=True,
                         help="Path to prepared dataset (.json or .joblib), e.g. prepared/DILI.json")
-    parser.add_argument("--ckpt", type=str, required=False, default="./outputs/checkpoints/training/en9_de4_20260122-152028/best.pt",
+    parser.add_argument("--ckpt_date", type=str, required=False, default="20260127-143109",
                         help="Path to your training checkpoint best.pt")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--out_dir", type=str, default="./logs_embedding/embedded_cache",
@@ -1009,7 +1186,10 @@ def main():
     parser.add_argument("--override", action="store_true",
                         help="Recompute embeddings even if cached exists")
     parser.add_argument("--enlayer",default=9)
-    parser.add_argument("--delayer",default=4)
+    parser.add_argument("--delayer",default=5)
+    parser.add_argument("--encoder_name", default="cls_graphormer")
+    parser.add_argument("--denoiser_name", default="uni_o2_condition")
+
     parser.add_argument("--embed_bs", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=8)
 
@@ -1029,13 +1209,17 @@ def main():
     cfg = OmegaConf.load(args.train_config)
     cfg.model.num_layers = int(args.delayer)
     cfg.encoder.num_layers = int(args.enlayer)
+    cfg.encoder.name = args.encoder_name
+    cfg.model.model_type = args.denoiser_name
 
     encoder_cfg = cfg.encoder
-    encoder_cfg
+
+    ckpt_file_name = f"en{args.enlayer}_de{args.delayer}_e_{args.encoder_name}_d_{args.denoiser_name}_{args.ckpt_date}"
+    ckpt_path = os.path.join("./outputs/checkpoints/training", ckpt_file_name, "best.pt")
 
     run_downstream_from_prepared(
         prepared_path=args.prepared_path,
-        ckpt_path=args.ckpt,
+        ckpt_path=ckpt_path,
         encoder_cfg=encoder_cfg,
         device=device,
         out_dir=args.out_dir,

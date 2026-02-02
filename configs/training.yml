@@ -61,7 +61,7 @@ train:
   batch_size: 1024
   num_workers: 6
   n_acc_batch: 8
-  max_iters: 14100
+  max_iters: 28200
   val_freq: 175
   pos_noise_std: 0.1
   max_grad_norm: 8.0
@@ -74,6 +74,9 @@ train:
     beta2: 0.999
   scheduler:
     type: plateau
-    factor: 0.6
-    patience: 10
+    factor: 0.5
+    patience: 3
     min_lr: 1.e-6
+    threshold_mode: abs
+    threshold: 5.e-4
+    cooldown: 1
