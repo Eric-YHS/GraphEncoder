@@ -1,37 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-ZINC_preprocess.py (two-phase)
-
-Phase A: download_raw
-  - Crawl ZINC20 3D tranche directory listing under https://files.docking.org/3D/
-  - Download *.sdf.gz files to local raw cache FIRST
-  - No RDKit parsing at this stage
-
-Phase B: preprocess_local
-  - Read local *.sdf.gz files (offline)
-  - For each molecule (protomer with 3D coords), build aligned 2D+3D record:
-      x: [N,9] OGB atom features (PCQM4M-style, non-negative ints)
-      edge_attr: [E,3] OGB bond features (non-negative ints)
-      pos: [N,3] float16 (from SDF conformer 0, optional centering)
-  - Save into LMDB
-
-Output layout (root default /mnt2/datasets/ZINC):
-  {root}/
-    raw_zinc20_3d/                      <-- downloaded raw files
-      AA/AAML/XXXXXX.xaa.sdf.gz ...
-      manifest_urls.txt                 <-- planned URLs (deterministic after crawl+filter)
-    zinc20_3d_{max_mols}_k1/            <-- processed dataset dir
-      zinc_confs.lmdb
-      meta.json
-      state.json
-
-Important:
-- Use OGB features to match typical AtomEncoder/BondEncoder pipelines.
-  Install: pip install ogb
-"""
-
 from __future__ import annotations
 
 import argparse

@@ -80,3 +80,27 @@ def str_tuple(argstr):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def update_config_with_args(config, args):
+    if args.encoder_layers is not None:
+        config.encoder.num_layers = int(args.encoder_layers)
+    if args.model_layers is not None:
+        config.model.num_layers = int(args.model_layers)
+    if args.encoder_name is not None:
+        config.encoder.name = args.encoder_name
+    if args.denoiser_name is not None:
+        config.model.model_type = args.denoiser_name
+
+    return config
+
+def update_config_with_data(config, batch):
+    config.data.node_in_dim = int(batch.x.shape[1])
+
+    if getattr(batch, "edge_attr", None) is None:
+        edge_in_dim = 0
+    else:
+        edge_in_dim = int(batch.edge_attr.shape[1])
+    config.data.edge_in_dim = edge_in_dim
+    config.model.edge_feat_dim = edge_in_dim + 2
+
+    return config

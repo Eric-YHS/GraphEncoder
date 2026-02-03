@@ -1,208 +1,270 @@
-import argparse
+# scripts/evaluate_diffusion.py
+from __future__ import annotations
 import os
+import sys
+import json
+from tqdm import tqdm
+import argparse
+from pathlib import Path
+from typing import List, Tuple, Dict, Any, Optional
+
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 import numpy as np
-from rdkit import Chem
-from rdkit import RDLogger
 import torch
-from tqdm.auto import tqdm
-from glob import glob
-from collections import Counter
+import utils.misc as misc
+from torch_geometric.data import Batch
+import time
+from collections import deque
+import torch
 
-from utils.evaluation import eval_atom_type, scoring_func, analyze, eval_bond_length
-from utils import misc, reconstruct, transforms
-from utils.evaluation.docking_qvina import QVinaDockingTask
-from utils.evaluation.docking_vina import VinaDockingTask
+from utils.covmat import pairwise_rmsd_matrix, covmat_from_rmsd, aggregate_covmat, CovMatResult
+from utils.builder import build_datasetLoader,build_diffusion,build_encoder, build_logger
 
+def _gpu_mem_gb(device):
+    if device.type != "cuda":
+        return None
+    alloc = torch.cuda.memory_allocated(device) / 1024**3
+    reserv = torch.cuda.memory_reserved(device) / 1024**3
+    return alloc, reserv
 
-def print_dict(d, logger):
-    for k, v in d.items():
-        if v is not None:
-            logger.info(f'{k}:\t{v:.4f}')
+def ckpt_path_from_tag(
+    ckpt_root: str,
+    enlayer: int,
+    delayer: int,
+    encoder_name: str,
+    denoiser_name: str,
+    ckpt_date: str
+) -> str:
+    # 与你 downstream 脚本一致的命名拼接方式
+    ckpt_dirname = f"en{enlayer}_de{delayer}_e_{encoder_name}_d_{denoiser_name}_{ckpt_date}"
+    ckpt_path = os.path.join(ckpt_root, ckpt_dirname, "best.pt")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
+    return ckpt_path
+
+def split_pos_by_graph(batch: Batch, pos: torch.Tensor) -> List[np.ndarray]:
+    pos_np = pos.detach().cpu().numpy()
+
+    if hasattr(batch, "ptr") and batch.ptr is not None:
+        ptr = batch.ptr.detach().cpu().numpy().astype(int)  # [B+1]
+    else:
+        # fallback: from batch.batch
+        counts = torch.bincount(batch.batch, minlength=batch.num_graphs).detach().cpu().numpy()
+        ptr = np.concatenate([[0], np.cumsum(counts).astype(int)])
+
+    out = []
+    for i in range(batch.num_graphs):
+        s, e = int(ptr[i]), int(ptr[i + 1])
+        out.append(pos_np[s:e])
+    return out
+
+@torch.no_grad()
+@torch.no_grad()
+def generate_positions_for_batch(
+    encoder: torch.nn.Module,
+    diffusion: torch.nn.Module,
+    batch: Batch,
+    n_samples: int,
+    mode: str,
+    t_recon: Optional[int] = None,
+) -> List[List[np.ndarray]]:
+
+    device = next(encoder.parameters()).device
+    batch = batch.to(device)
+
+    encoder.eval()
+    diffusion.eval()
+
+    cond_node_emb, graph_emb = encoder(batch)  # node_emb, graph_emb
+
+    out: List[List[np.ndarray]] = [[] for _ in range(batch.num_graphs)]
+
+    for _ in range(n_samples):
+        if mode == "sample":
+            pos_pred = diffusion.sample(
+                batch_obj=batch,
+                cond_node_emb=cond_node_emb,
+                graph_emb=graph_emb,
+            )
+        elif mode == "reconstruct":
+            t_start = (diffusion.num_timesteps - 1) if t_recon is None else int(t_recon)
+            pos_pred = diffusion.reconstruct_from_clean(
+                batch_obj=batch,
+                x0=batch.pos,
+                t_start=t_start,
+                cond_node_emb=cond_node_emb,
+                graph_emb=graph_emb,
+            )
         else:
-            logger.info(f'{k}:\tNone')
+            raise ValueError(f"Unknown mode: {mode}")
+
+        per_graph = split_pos_by_graph(batch, pos_pred)
+        for g in range(batch.num_graphs):
+            out[g].append(per_graph[g])
+
+    return out
+
+def evaluate_covmat(
+    preds_per_graph: List[List[np.ndarray]],
+    refs_per_graph: List[np.ndarray],
+    threshold: float,
+) -> Tuple[Dict[str, float], List[CovMatResult]]:
+    """
+    每个分子只有 1 个 ref 构象：refs_per_graph[g] 是 [n,3]。
+    preds_per_graph[g] 是 K 个 [n,3]。
+    """
+    per_mol: List[CovMatResult] = []
+    for g in range(len(refs_per_graph)):
+        refs = [refs_per_graph[g]]
+        preds = preds_per_graph[g]
+        rmsd = pairwise_rmsd_matrix(preds, refs)  # [K,1]
+        per_mol.append(covmat_from_rmsd(rmsd, threshold=threshold))
+    agg = aggregate_covmat(per_mol)
+    return agg, per_mol
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt_root", type=str, default="outputs/checkpoints/training")
+    ap.add_argument("--ckpt_date", type=str, default="20260127-143109")
+    ap.add_argument("--encoder_layers", type=int, default=9)
+    ap.add_argument("--model_layers", type=int, default=5)
+    ap.add_argument("--encoder_name", type=str, default="cls_graphormer")
+    ap.add_argument("--denoiser_name", type=str, default="uni_o2_condition")
+
+    ap.add_argument("--device", type=str, default="cuda:0")
+    ap.add_argument("--n_samples", type=int, default=2)  # GeoDiff 系通常 Sg=2*Sr；你这 Sr=1 -> 2
+    ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--mode", type=str, choices=["sample", "reconstruct"], default="sample")
+    ap.add_argument("--t_recon", type=int, default=None)
+
+    ap.add_argument("--out_json", type=str, default="eval_covmat.json")
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--num_workers", type=int, default=0)
+
+    # 数据集/配置：按你工程现有方式补齐
+    ap.add_argument("--train_config", type=str, default="configs/training.yml")
+    ap.add_argument("--split", type=str, default="test")
+
+    args = ap.parse_args()
+    
+    # config
+    config = misc.load_config(args.train_config)
+    misc.seed_all(config.train.seed)
+
+    device = torch.device(args.device)
+    config = misc.update_config_with_args(config, args)
+    ckpt_path = ckpt_path_from_tag(
+        args.ckpt_root, args.encoder_layers, args.model_layers,
+        args.encoder_name, args.denoiser_name, args.ckpt_date
+    )
+
+    # logger
+    logger, writer, log_dir = build_logger(args, config, train=False)
+
+    # dataset
+    train_loader, val_loader, test_loader, train_iterator = build_datasetLoader(config, logger, test_scale=0.1)
+    batch0 = next(train_iterator)
+    config = misc.update_config_with_data(config, batch0)
+    logger.info(f"Auto inferred dims: node_in_dim={config.data.node_in_dim}, "
+                f"edge_in_dim={config.data.edge_in_dim}, model.edge_feat_dim={config.model.edge_feat_dim}")
+    logger.info(f"ckpt_path: {ckpt_path}")
+    logger.info(f"split={args.split} mode={args.mode} n_samples={args.n_samples} thr={args.threshold} bs={args.batch_size}")
 
 
-def print_ring_ratio(all_ring_sizes, logger):
-    for ring_size in range(3, 10):
-        n_mol = 0
-        for counter in all_ring_sizes:
-            if ring_size in counter:
-                n_mol += 1
-        logger.info(f'ring size: {ring_size} ratio: {n_mol / len(all_ring_sizes):.3f}')
+    # model
+    encoder = build_encoder(config, device)
+    diffusion = build_diffusion(config, device)
 
+    # ckpt
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    encoder.load_state_dict(ckpt["encoder"], strict=True)
+    diffusion.load_state_dict(ckpt["diffusion"], strict=True)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('sample_path', type=str)
-    parser.add_argument('--verbose', type=eval, default=False)
-    parser.add_argument('--eval_step', type=int, default=-1)
-    parser.add_argument('--eval_num_examples', type=int, default=None)
-    parser.add_argument('--save', type=eval, default=True)
-    parser.add_argument('--protein_root', type=str, default='./data/crossdocked_v1.1_rmsd1.0')
-    parser.add_argument('--atom_enc_mode', type=str, default='add_aromatic')
-    parser.add_argument('--docking_mode', type=str, choices=['qvina', 'vina_score', 'vina_dock', 'none'])
-    parser.add_argument('--exhaustiveness', type=int, default=16)
-    args = parser.parse_args()
+    # ========= 4) run eval =========
+    all_per_mol: List[CovMatResult] = []
 
-    result_path = os.path.join(args.sample_path, 'eval_results')
-    os.makedirs(result_path, exist_ok=True)
-    logger = misc.get_logger('evaluate', log_dir=result_path)
-    if not args.verbose:
-        RDLogger.DisableLog('rdApp.*')
+    if args.split == "train":
+        loader = train_loader
+    elif args.split == "eval":
+        loader = val_loader
+    else:
+        loader = test_loader
 
-    # Load generated data
-    results_fn_list = glob(os.path.join(args.sample_path, '*result_*.pt'))
-    results_fn_list = sorted(results_fn_list, key=lambda x: int(os.path.basename(x)[:-3].split('_')[-1]))
-    if args.eval_num_examples is not None:
-        results_fn_list = results_fn_list[:args.eval_num_examples]
-    num_examples = len(results_fn_list)
-    logger.info(f'Load generated data done! {num_examples} examples in total.')
+    out_json = args.out_json
+    if not os.path.isabs(out_json):
+        out_json = os.path.join(log_dir, out_json)
 
-    num_samples = 0
-    all_mol_stable, all_atom_stable, all_n_atom = 0, 0, 0
-    n_recon_success, n_eval_success, n_complete = 0, 0, 0
-    results = []
-    all_pair_dist, all_bond_dist = [], []
-    all_atom_types = Counter()
-    success_pair_dist, success_atom_types = [], Counter()
-    for example_idx, r_name in enumerate(tqdm(results_fn_list, desc='Eval')):
-        r = torch.load(r_name)  # ['data', 'pred_ligand_pos', 'pred_ligand_v', 'pred_ligand_pos_traj', 'pred_ligand_v_traj']
-        all_pred_ligand_pos = r['pred_ligand_pos_traj']  # [num_samples, num_steps, num_atoms, 3]
-        all_pred_ligand_v = r['pred_ligand_v_traj']
-        num_samples += len(all_pred_ligand_pos)
+    batch_times = deque(maxlen=20)
+    n_seen = 0
+    log_every=10
 
-        for sample_idx, (pred_pos, pred_v) in enumerate(zip(all_pred_ligand_pos, all_pred_ligand_v)):
-            pred_pos, pred_v = pred_pos[args.eval_step], pred_v[args.eval_step]
+    for bi, batch in enumerate(tqdm(loader, desc=f"eval[{args.split}]")):
+        tb0 = time.time()
+        batch = batch.to(device)
 
-            # stability check
-            pred_atom_type = transforms.get_atomic_number_from_index(pred_v, mode=args.atom_enc_mode)
-            all_atom_types += Counter(pred_atom_type)
-            r_stable = analyze.check_stability(pred_pos, pred_atom_type)
-            all_mol_stable += r_stable[0]
-            all_atom_stable += r_stable[1]
-            all_n_atom += r_stable[2]
+        refs_per_graph = split_pos_by_graph(batch, batch.pos)
 
-            pair_dist = eval_bond_length.pair_distance_from_pos_v(pred_pos, pred_atom_type)
-            all_pair_dist += pair_dist
+        preds_per_graph = generate_positions_for_batch(
+            encoder=encoder,
+            diffusion=diffusion,
+            batch=batch,
+            n_samples=args.n_samples,
+            mode=args.mode,
+            t_recon=args.t_recon,
+        )
 
-            # reconstruction
-            try:
-                pred_aromatic = transforms.is_aromatic_from_index(pred_v, mode=args.atom_enc_mode)
-                mol = reconstruct.reconstruct_from_generated(pred_pos, pred_atom_type, pred_aromatic)
-                smiles = Chem.MolToSmiles(mol)
-            except reconstruct.MolReconsError:
-                if args.verbose:
-                    logger.warning('Reconstruct failed %s' % f'{example_idx}_{sample_idx}')
-                continue
-            n_recon_success += 1
+        # per-batch covmat
+        _, per_mol = evaluate_covmat(preds_per_graph, refs_per_graph, threshold=args.threshold)
+        all_per_mol.extend(per_mol)
 
-            if '.' in smiles:
-                continue
-            n_complete += 1
+        n_seen += int(batch.num_graphs)
+        batch_times.append(time.time() - tb0)
 
-            # chemical and docking check
-            try:
-                chem_results = scoring_func.get_chem(mol)
-                if args.docking_mode == 'qvina':
-                    vina_task = QVinaDockingTask.from_generated_mol(
-                        mol, r['data'].ligand_filename, protein_root=args.protein_root)
-                    vina_results = vina_task.run_sync()
-                elif args.docking_mode in ['vina_score', 'vina_dock']:
-                    vina_task = VinaDockingTask.from_generated_mol(
-                        mol, r['data'].ligand_filename, protein_root=args.protein_root)
-                    score_only_results = vina_task.run(mode='score_only', exhaustiveness=args.exhaustiveness)
-                    minimize_results = vina_task.run(mode='minimize', exhaustiveness=args.exhaustiveness)
-                    vina_results = {
-                        'score_only': score_only_results,
-                        'minimize': minimize_results
-                    }
-                    if args.docking_mode == 'vina_dock':
-                        docking_results = vina_task.run(mode='dock', exhaustiveness=args.exhaustiveness)
-                        vina_results['dock'] = docking_results
-                else:
-                    vina_results = None
+        if (bi == 0) or ((bi + 1) % log_every == 0):
+            # 在线聚合一下当前结果，便于观察是否在“跑着但没产出”
+            cur = aggregate_covmat(all_per_mol)
 
-                n_eval_success += 1
-            except:
-                if args.verbose:
-                    logger.warning('Evaluation failed for %s' % f'{example_idx}_{sample_idx}')
-                continue
+            msg = (f"[eval] batch={bi+1}/{len(loader)} "
+                f"mols={n_seen} (+{batch.num_graphs}) "
+                f"avg_batch_time={sum(batch_times)/len(batch_times):.2f}s "
+                f"COV-R={cur.get('COV-R', float('nan')):.4f} "
+                f"MAT-R={cur.get('MAT-R', float('nan')):.4f} "
+                f"COV-P={cur.get('COV-P', float('nan')):.4f} "
+                f"MAT-P={cur.get('MAT-P', float('nan')):.4f}")
 
-            # now we only consider complete molecules as success
-            bond_dist = eval_bond_length.bond_distance_from_mol(mol)
-            all_bond_dist += bond_dist
+            if device.type == "cuda":
+                alloc, reserv = _gpu_mem_gb(device)
+                msg += f" | gpu_mem(alloc/reserv)={alloc:.2f}/{reserv:.2f}GB"
 
-            success_pair_dist += pair_dist
-            success_atom_types += Counter(pred_atom_type)
+            logger.info(msg)
+            # log sample scale statistics
+            counts = torch.bincount(batch.batch).detach().cpu().numpy()
+            logger.info(f"[batch stats] num_nodes: min={counts.min()} p50={np.median(counts):.0f} max={counts.max()}")
 
-            results.append({
-                'mol': mol,
-                'smiles': smiles,
-                'ligand_filename': r['data'].ligand_filename,
-                'pred_pos': pred_pos,
-                'pred_v': pred_v,
-                'chem_results': chem_results,
-                'vina': vina_results
-            })
-    logger.info(f'Evaluate done! {num_samples} samples in total.')
-
-    fraction_mol_stable = all_mol_stable / num_samples
-    fraction_atm_stable = all_atom_stable / all_n_atom
-    fraction_recon = n_recon_success / num_samples
-    fraction_eval = n_eval_success / num_samples
-    fraction_complete = n_complete / num_samples
-    validity_dict = {
-        'mol_stable': fraction_mol_stable,
-        'atm_stable': fraction_atm_stable,
-        'recon_success': fraction_recon,
-        'eval_success': fraction_eval,
-        'complete': fraction_complete
+    final = aggregate_covmat(all_per_mol)
+    payload = {
+        "config": {
+            "enlayer": args.encoder_layers,
+            "delayer": args.model_layers,
+            "encoder_name": args.encoder_name,
+            "denoiser_name": args.denoiser_name,
+            "ckpt_date": args.ckpt_date,
+            "n_samples": args.n_samples,
+            "threshold": args.threshold,
+            "mode": args.mode,
+            "t_recon": args.t_recon,
+        },
+        "metrics": final,
+        "n_molecules": len(all_per_mol),
     }
-    print_dict(validity_dict, logger)
 
-    c_bond_length_profile = eval_bond_length.get_bond_length_profile(all_bond_dist)
-    c_bond_length_dict = eval_bond_length.eval_bond_length_profile(c_bond_length_profile)
-    logger.info('JS bond distances of complete mols: ')
-    print_dict(c_bond_length_dict, logger)
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    success_pair_length_profile = eval_bond_length.get_pair_length_profile(success_pair_dist)
-    success_js_metrics = eval_bond_length.eval_pair_length_profile(success_pair_length_profile)
-    print_dict(success_js_metrics, logger)
+    logger.info(f"[DONE] saved: {args.out_json}")
+    logger.info(f"{final}")
 
-    atom_type_js = eval_atom_type.eval_atom_type_distribution(success_atom_types)
-    logger.info('Atom type JS: %.4f' % atom_type_js)
-
-    if args.save:
-        eval_bond_length.plot_distance_hist(success_pair_length_profile,
-                                            metrics=success_js_metrics,
-                                            save_path=os.path.join(result_path, f'pair_dist_hist_{args.eval_step}.png'))
-
-    logger.info('Number of reconstructed mols: %d, complete mols: %d, evaluated mols: %d' % (
-        n_recon_success, n_complete, len(results)))
-
-    qed = [r['chem_results']['qed'] for r in results]
-    sa = [r['chem_results']['sa'] for r in results]
-    logger.info('QED:   Mean: %.3f Median: %.3f' % (np.mean(qed), np.median(qed)))
-    logger.info('SA:    Mean: %.3f Median: %.3f' % (np.mean(sa), np.median(sa)))
-    if args.docking_mode == 'qvina':
-        vina = [r['vina'][0]['affinity'] for r in results]
-        logger.info('Vina:  Mean: %.3f Median: %.3f' % (np.mean(vina), np.median(vina)))
-    elif args.docking_mode in ['vina_dock', 'vina_score']:
-        vina_score_only = [r['vina']['score_only'][0]['affinity'] for r in results]
-        vina_min = [r['vina']['minimize'][0]['affinity'] for r in results]
-        logger.info('Vina Score:  Mean: %.3f Median: %.3f' % (np.mean(vina_score_only), np.median(vina_score_only)))
-        logger.info('Vina Min  :  Mean: %.3f Median: %.3f' % (np.mean(vina_min), np.median(vina_min)))
-        if args.docking_mode == 'vina_dock':
-            vina_dock = [r['vina']['dock'][0]['affinity'] for r in results]
-            logger.info('Vina Dock :  Mean: %.3f Median: %.3f' % (np.mean(vina_dock), np.median(vina_dock)))
-
-    # check ring distribution
-    print_ring_ratio([r['chem_results']['ring_size'] for r in results], logger)
-
-    if args.save:
-        torch.save({
-            'stability': validity_dict,
-            'bond_length': all_bond_dist,
-            'all_results': results
-        }, os.path.join(result_path, f'metrics_{args.eval_step}.pt'))
+if __name__ == "__main__":
+    main()

@@ -298,7 +298,7 @@ class MolPosDiffusion(nn.Module):
 
         # importance sampling bookkeeping（可选）
         self.register_buffer('Lt_history', torch.zeros(self.num_timesteps))
-        self.register_buffer('Lt_history', torch.zeros(self.num_timesteps))
+        self.register_buffer('Lt_count', torch.zeros(self.num_timesteps))
 
     def q_pos_sample(self, x0: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
         """
@@ -412,7 +412,6 @@ class MolPosDiffusion(nn.Module):
             target = pos0
             loss_node = ((pred - target) ** 2).sum(-1)  # [N]
         elif self.model_mean_type == 'noise':
-            # 如果你想切到噪声预测，需要把 refine_net 输出解释成 eps；这里先给接口，不建议一开始用
             target = eps
             loss_node = ((pred - target) ** 2).sum(-1)
         else:
@@ -428,6 +427,219 @@ class MolPosDiffusion(nn.Module):
             "pos_t": pos_t,
             "pred_x0": pred,
         }
+
+    def _predict_x0_from_eps(self, x_t: torch.Tensor, eps: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
+        """
+        x0 = (x_t - sqrt(1-a_hat) * eps) / sqrt(a_hat)
+        t: [B], batch: [N]
+        """
+        sqrt_a = extract(self.sqrt_alphas_cumprod, t, batch)                 # [N,1]
+        sqrt_1m = extract(self.sqrt_one_minus_alphas_cumprod, t, batch)      # [N,1]
+        x0 = (x_t - sqrt_1m * eps) / (sqrt_a + 1e-12)
+        return x0
+
+    def _model_pred_to_x0(self, x_t: torch.Tensor, model_out_x: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
+        """
+        将网络输出解释成 x0_pred
+        - mean_type=C0: model_out_x 就是 x0
+        - mean_type=noise: model_out_x 是 eps
+        """
+        if self.model_mean_type == "C0":
+            return model_out_x
+        elif self.model_mean_type == "noise":
+            return self._predict_x0_from_eps(x_t, model_out_x, t, batch)
+        else:
+            raise ValueError(f"Unknown model_mean_type: {self.model_mean_type}")
+
+    @torch.no_grad()
+    def p_mean_variance(
+        self,
+        batch_obj,               # PyG Batch
+        x_t: torch.Tensor,       # [N,3]
+        cond_node_emb: torch.Tensor,
+        t: torch.Tensor,         # [B] long
+    ):
+        """
+        计算 p(x_{t-1} | x_t) 的 mean/logvar（DDPM：用 q posterior + x0_pred）
+        返回：
+          mean: [N,3]
+          logvar: [N,1]
+          x0_pred: [N,3]
+        """
+        batch_id = batch_obj.batch
+        x = batch_obj.x
+        bond_edge_index = batch_obj.edge_index
+        bond_edge_attr = batch_obj.edge_attr.float() if hasattr(batch_obj, "edge_attr") and batch_obj.edge_attr is not None else None
+
+        # 保持居中，减少漂移
+        if self.center_pos_mode != "none":
+            x_t, _, _ = center_pos_mol(x_t, batch_id, mode=self.center_pos_mode)
+
+        out = self.forward(
+            pos_t=x_t,
+            x=x,
+            batch=batch_id,
+            cond_node_emb=cond_node_emb,
+            time_step=t,
+            bond_edge_index=bond_edge_index,
+            bond_edge_attr=bond_edge_attr,
+            return_all=False,
+            fix_x=False,
+        )
+        model_out = out["x"]  # [N,3]（解释为 x0 或 eps）
+
+        x0_pred = self._model_pred_to_x0(x_t, model_out, t, batch_id)       # [N,3]
+        mean = self.q_pos_posterior_mean(x0_pred, x_t, t, batch_id)         # [N,3]
+        logvar = extract(self.posterior_logvar, t, batch_id)                # [N,1]
+
+        return mean, logvar, x0_pred
+
+    @torch.no_grad()
+    def p_sample(
+        self,
+        batch_obj,
+        x_t: torch.Tensor,            # [N,3]
+        cond_node_emb: torch.Tensor,
+        t: torch.Tensor,              # [B] long
+    ):
+        """
+        单步采样：x_{t-1} ~ N(mean, var)
+        """
+        mean, logvar, x0_pred = self.p_mean_variance(
+            batch_obj=batch_obj,
+            x_t=x_t,
+            cond_node_emb=cond_node_emb,
+            t=t,
+        )
+
+        # t==0 时不加噪声
+        if (t == 0).all():
+            x_prev = mean
+        else:
+            noise = torch.randn_like(x_t)
+            x_prev = mean + torch.exp(0.5 * logvar) * noise
+
+        if self.center_pos_mode != "none":
+            x_prev, _, _ = center_pos_mol(x_prev, batch_obj.batch, mode=self.center_pos_mode)
+
+        return x_prev, x0_pred
+
+    @torch.no_grad()
+    def p_sample_loop(
+        self,
+        batch_obj,
+        cond_node_emb: torch.Tensor,
+        x_T: torch.Tensor = None,     # [N,3] 可选：给定初始噪声
+        return_traj: bool = False,
+    ):
+        """
+        从 t=T-1 迭代到 0，返回 x0（以及可选轨迹）
+        """
+        device = batch_obj.x.device
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+        N = batch_obj.x.size(0)
+
+        x_t = torch.randn((N, 3), device=device) if x_T is None else x_T
+
+        if self.center_pos_mode != "none":
+            x_t, _, _ = center_pos_mol(x_t, batch_id, mode=self.center_pos_mode)
+
+        traj = []
+        for step in reversed(range(self.num_timesteps)):
+            t_graph = torch.full((B,), step, device=device, dtype=torch.long)
+            x_t, _ = self.p_sample(
+                batch_obj=batch_obj,
+                x_t=x_t,
+                cond_node_emb=cond_node_emb,
+                t=t_graph,
+            )
+            if return_traj:
+                traj.append(x_t.detach().cpu())
+
+        return (x_t, traj) if return_traj else x_t
+
+    # =========================
+    #  Public APIs
+    # =========================
+
+    @torch.no_grad()
+    def sample(
+        self,
+        batch_obj,
+        cond_node_emb: torch.Tensor,
+        return_traj: bool = False,
+    ):
+        """
+        纯噪声生成：x_T ~ N(0,I) -> x0
+        """
+        return self.p_sample_loop(
+            batch_obj=batch_obj,
+            cond_node_emb=cond_node_emb,
+            x_T=None,
+            return_traj=return_traj,
+        )
+
+    @torch.no_grad()
+    def reconstruct_from_noisy(
+        self,
+        batch_obj,
+        x_t: torch.Tensor,            # 给定某个噪声步的坐标 [N,3]
+        t_start: int,                 # 从 t_start 开始反推到 0
+        cond_node_emb: torch.Tensor,
+        return_traj: bool = False,
+    ):
+        device = batch_obj.x.device
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+
+        x_cur = x_t
+        if self.center_pos_mode != "none":
+            x_cur, _, _ = center_pos_mol(x_cur, batch_id, mode=self.center_pos_mode)
+
+        traj = []
+        for step in reversed(range(t_start + 1)):
+            t_graph = torch.full((B,), step, device=device, dtype=torch.long)
+            x_cur, _ = self.p_sample(
+                batch_obj=batch_obj,
+                x_t=x_cur,
+                cond_node_emb=cond_node_emb,
+                t=t_graph,
+            )
+            if return_traj:
+                traj.append(x_cur.detach().cpu())
+
+        return (x_cur, traj) if return_traj else x_cur
+
+    @torch.no_grad()
+    def reconstruct_from_clean(
+        self,
+        batch_obj,
+        x0: torch.Tensor,             # 干净坐标 [N,3]
+        t_start: int,
+        cond_node_emb: torch.Tensor,
+        return_traj: bool = False,
+    ):
+        """
+        先 q_sample 加噪到 x_t_start，然后反推回 x0
+        """
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+        t_graph = torch.full((B,), t_start, device=x0.device, dtype=torch.long)
+
+        x0c = x0
+        if self.center_pos_mode != "none":
+            x0c, _, _ = center_pos_mol(x0c, batch_id, mode=self.center_pos_mode)
+
+        x_t, _ = self.q_pos_sample(x0c, t_graph, batch_id)
+        return self.reconstruct_from_noisy(
+            batch_obj=batch_obj,
+            x_t=x_t,
+            t_start=t_start,
+            cond_node_emb=cond_node_emb,
+            return_traj=return_traj,
+        )
+
 
 class MolPosDiffusion_condition(nn.Module):
     """
@@ -700,6 +912,223 @@ class MolPosDiffusion_condition(nn.Module):
             "pos_t": pos_t,
             "pred_x0": pred,
         }
+    def _center_graph(self, x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        # x: [N,3]
+        if self.center_pos_mode == "none":
+            return x
+        x, _, _ = center_pos_mol(x, batch, mode=self.center_pos_mode)
+        return x
+
+    def _com_free_noise_like(self, ref: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        z = torch.randn_like(ref)
+        return self._center_graph(z, batch)  # 让噪声本身每个图零均值（CoM-free）
+
+    def _predict_x0_from_eps(self, x_t: torch.Tensor, eps: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
+        """
+        x0 = (x_t - sqrt(1-a_hat) * eps) / sqrt(a_hat)
+        """
+        sqrt_a = extract(self.sqrt_alphas_cumprod, t, batch)                 # [N,1]
+        sqrt_1m = extract(self.sqrt_one_minus_alphas_cumprod, t, batch)      # [N,1]
+        x0 = (x_t - sqrt_1m * eps) / (sqrt_a + 1e-12)
+        return x0
+
+    def _model_pred_to_x0(self, x_t: torch.Tensor, model_out_x: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
+        if self.model_mean_type == "C0":
+            return model_out_x
+        elif self.model_mean_type == "noise":
+            return self._predict_x0_from_eps(x_t, model_out_x, t, batch)
+        else:
+            raise ValueError(f"Unknown model_mean_type: {self.model_mean_type}")
+
+    @torch.no_grad()
+    def p_mean_variance(
+        self,
+        batch_obj,
+        x_t: torch.Tensor,
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        t: torch.Tensor,                     # [B] long
+        unconditioned: bool = False,
+        clip_x0: bool = False,
+    ):
+        """
+        返回:
+          mean:    [N,3]   posterior mean
+          logvar:  [N,1]   posterior log-variance
+          x0_pred: [N,3]
+        """
+        batch_id = batch_obj.batch
+        x = batch_obj.x
+        bond_edge_index = batch_obj.edge_index
+        bond_edge_attr = batch_obj.edge_attr if getattr(batch_obj, "edge_attr", None) is not None else None
+
+        out = self.forward(
+            pos_t=x_t,
+            x=x,
+            batch=batch_id,
+            cond_node_emb=cond_node_emb,
+            graph_emb=graph_emb,
+            time_step=t,
+            bond_edge_index=bond_edge_index,
+            bond_edge_attr=bond_edge_attr,
+            return_all=False,
+            fix_x=False,
+            unconditioned=unconditioned,
+        )
+        model_out = out["x"]  # interpret according to model_mean_type
+
+        # --- convert model output -> x0_pred ---
+        x0_pred = self._model_pred_to_x0(x_t, model_out, t, batch_id)
+
+        if clip_x0:
+            # 位置一般不建议硬 clip，但可以先留一个开关便于 debug
+            x0_pred = x0_pred.clamp(min=-20.0, max=20.0)
+
+        # --- posterior mean/var (DDPM aligned) ---
+        mean = self.q_pos_posterior_mean(x0_pred, x_t, t, batch_id)
+
+        # posterior variance 更稳（你初始化里已经算好了）
+        # 用 posterior_logvar 也行（数值更稳定）
+        logvar = extract(self.posterior_logvar, t, batch_id)  # [N,1]
+        # 或者：
+        # var = extract(self.posterior_var, t, batch_id)
+        # logvar = torch.log(var.clamp(min=1e-20))
+
+        # 保持 CoM-free（如果你训练时就是这么做的）
+        mean = self._center_graph(mean, batch_id)
+
+        return mean, logvar, x0_pred
+
+    @torch.no_grad()
+    def p_sample(self, batch_obj, x_t, cond_node_emb, graph_emb, t,
+                unconditioned: bool = False,
+                deterministic: bool = False):
+        batch_id = batch_obj.batch
+        mu, logvar, x0_pred = self.p_mean_variance(batch_obj, x_t, cond_node_emb, graph_emb, t, unconditioned)
+
+        if deterministic or (t == 0).all():
+            x_prev = mu
+        else:
+            z = self._com_free_noise_like(x_t, batch_id)
+            x_prev = mu + torch.exp(0.5 * logvar) * z
+
+        return x_prev, x0_pred
+
+
+    @torch.no_grad()
+    def p_sample_loop(
+        self,
+        batch_obj,
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        x_T = None,
+        return_traj: bool = False,
+        unconditioned: bool = False,
+        deterministic: bool = False,
+        center_output: bool = True,
+    ):
+        device = batch_obj.x.device
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+        N = batch_obj.x.size(0)
+
+        if x_T is None:
+            x_t = torch.randn((N, 3), device=device)
+            x_t = self._center_graph(x_t, batch_id)
+        else:
+            x_t = x_T
+            x_t = self._center_graph(x_t, batch_id)
+
+        traj = []
+        for step in reversed(range(self.num_timesteps)):
+            t_graph = torch.full((B,), step, device=device, dtype=torch.long)
+            x_t, _ = self.p_sample(
+                batch_obj, x_t, cond_node_emb, graph_emb, t_graph,
+                unconditioned=unconditioned,
+                deterministic=deterministic,
+            )
+            if return_traj:
+                traj.append(x_t.detach().cpu())
+
+        if center_output and self.center_pos_mode != "none":
+            x_t = self._center_graph(x_t, batch_id)
+
+        return (x_t, traj) if return_traj else x_t
+
+    @torch.no_grad()
+    def sample(self, batch_obj, cond_node_emb, graph_emb, return_traj: bool = False):
+        """
+        纯生成：默认 stochastic（符合 DDPM）
+        """
+        return self.p_sample_loop(
+            batch_obj, cond_node_emb, graph_emb,
+            x_T=None,
+            return_traj=return_traj,
+            deterministic=False,
+            center_output=True,
+        )
+
+    @torch.no_grad()
+    def reconstruct_from_noisy(
+        self,
+        batch_obj,
+        x_t: torch.Tensor,
+        t_start: int,
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        return_traj: bool = False,
+        deterministic: bool = True,     # ✅ 重建建议默认 deterministic
+    ):
+        device = batch_obj.x.device
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+
+        x_cur = self._center_graph(x_t, batch_id)
+        traj = []
+
+        for step in reversed(range(t_start + 1)):
+            t_graph = torch.full((B,), step, device=device, dtype=torch.long)
+            x_cur, _ = self.p_sample(
+                batch_obj, x_cur, cond_node_emb, graph_emb, t_graph,
+                deterministic=deterministic,
+            )
+            if return_traj:
+                traj.append(x_cur.detach().cpu())
+
+        return (x_cur, traj) if return_traj else x_cur
+
+    @torch.no_grad()
+    def reconstruct_from_clean(
+        self,
+        batch_obj,
+        x0: torch.Tensor,
+        t_start: int,
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        return_traj: bool = False,
+        deterministic: bool = True,
+    ):
+        """
+        先 q_sample 得到 x_t_start，再反推。
+        """
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+        t_graph = torch.full((B,), t_start, device=x0.device, dtype=torch.long)
+
+        x0c = self._center_graph(x0, batch_id)    # ✅ 对齐训练（你训练时 center_pos_mol 了）
+        x_t, _ = self.q_pos_sample(x0c, t_graph, batch_id)
+
+        return self.reconstruct_from_noisy(
+            batch_obj=batch_obj,
+            x_t=x_t,
+            t_start=t_start,
+            cond_node_emb=cond_node_emb,
+            graph_emb=graph_emb,
+            return_traj=return_traj,
+            deterministic=deterministic,
+        )
+
+
 
 class MolPosDiffusion_cat(nn.Module):
     """
@@ -783,7 +1212,7 @@ class MolPosDiffusion_cat(nn.Module):
 
         # importance sampling bookkeeping（可选）
         self.register_buffer('Lt_history', torch.zeros(self.num_timesteps))
-        self.register_buffer('Lt_history', torch.zeros(self.num_timesteps))
+        self.register_buffer('Lt_count', torch.zeros(self.num_timesteps))
 
         # node dropout
         self.node_dropout = config.node_dropout
@@ -955,6 +1384,230 @@ class MolPosDiffusion_cat(nn.Module):
             "pred_x0": pred,
         }
 
+
+    def _predict_x0_from_eps(self, x_t: torch.Tensor, eps: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
+        """
+        x0 = (x_t - sqrt(1-a_hat) * eps) / sqrt(a_hat)
+        t: [B], batch: [N]
+        """
+        sqrt_a = extract(self.sqrt_alphas_cumprod, t, batch)                 # [N,1]
+        sqrt_1m = extract(self.sqrt_one_minus_alphas_cumprod, t, batch)      # [N,1]
+        x0 = (x_t - sqrt_1m * eps) / (sqrt_a + 1e-12)
+        return x0
+
+    def _model_pred_to_x0(self, x_t: torch.Tensor, model_out_x: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
+        """
+        将网络输出解释成 x0_pred
+        - mean_type=C0: model_out_x 就是 x0
+        - mean_type=noise: model_out_x 是 eps
+        """
+        if self.model_mean_type == "C0":
+            return model_out_x
+        elif self.model_mean_type == "noise":
+            return self._predict_x0_from_eps(x_t, model_out_x, t, batch)
+        else:
+            raise ValueError(f"Unknown model_mean_type: {self.model_mean_type}")
+
+    @torch.no_grad()
+    def p_mean_variance(
+        self,
+        batch_obj,               # PyG Batch
+        x_t: torch.Tensor,       # [N,3]
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        t: torch.Tensor,         # [B] long
+    ):
+        """
+        计算 p(x_{t-1} | x_t) 的 mean/logvar（DDPM：用 q posterior + x0_pred）
+        返回：
+          mean: [N,3]
+          logvar: [N,1]
+          x0_pred: [N,3]
+        """
+        batch_id = batch_obj.batch
+        x = batch_obj.x
+        bond_edge_index = batch_obj.edge_index
+        bond_edge_attr = batch_obj.edge_attr.float() if hasattr(batch_obj, "edge_attr") and batch_obj.edge_attr is not None else None
+
+        # 保持居中，减少漂移
+        if self.center_pos_mode != "none":
+            x_t, _, _ = center_pos_mol(x_t, batch_id, mode=self.center_pos_mode)
+
+        out = self.forward(
+            pos_t=x_t,
+            x=x,
+            batch=batch_id,
+            cond_node_emb=cond_node_emb,
+            graph_emb=graph_emb,               # 这里保持原样，forward 内部会 _ensure + [batch]
+            time_step=t,
+            bond_edge_index=bond_edge_index,
+            bond_edge_attr=bond_edge_attr,
+            return_all=False,
+            fix_x=False,
+        )
+        model_out = out["x"]  # [N,3]（解释为 x0 或 eps）
+
+        x0_pred = self._model_pred_to_x0(x_t, model_out, t, batch_id)       # [N,3]
+        mean = self.q_pos_posterior_mean(x0_pred, x_t, t, batch_id)         # [N,3]
+        logvar = extract(self.posterior_logvar, t, batch_id)                # [N,1]
+
+        return mean, logvar, x0_pred
+
+    @torch.no_grad()
+    def p_sample(
+        self,
+        batch_obj,
+        x_t: torch.Tensor,            # [N,3]
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        t: torch.Tensor,              # [B] long
+    ):
+        """
+        单步采样：x_{t-1} ~ N(mean, var)
+        """
+        mean, logvar, x0_pred = self.p_mean_variance(
+            batch_obj=batch_obj,
+            x_t=x_t,
+            cond_node_emb=cond_node_emb,
+            graph_emb=graph_emb,
+            t=t,
+        )
+
+        # t==0 时不加噪声
+        if (t == 0).all():
+            x_prev = mean
+        else:
+            noise = torch.randn_like(x_t)
+            x_prev = mean + torch.exp(0.5 * logvar) * noise
+
+        if self.center_pos_mode != "none":
+            x_prev, _, _ = center_pos_mol(x_prev, batch_obj.batch, mode=self.center_pos_mode)
+
+        return x_prev, x0_pred
+
+    @torch.no_grad()
+    def p_sample_loop(
+        self,
+        batch_obj,
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        x_T: torch.Tensor = None,     # [N,3] 可选：给定初始噪声
+        return_traj: bool = False,
+    ):
+        """
+        从 t=T-1 迭代到 0，返回 x0（以及可选轨迹）
+        """
+        device = batch_obj.x.device
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+        N = batch_obj.x.size(0)
+
+        x_t = torch.randn((N, 3), device=device) if x_T is None else x_T
+
+        if self.center_pos_mode != "none":
+            x_t, _, _ = center_pos_mol(x_t, batch_id, mode=self.center_pos_mode)
+
+        traj = []
+        for step in reversed(range(self.num_timesteps)):
+            t_graph = torch.full((B,), step, device=device, dtype=torch.long)
+            x_t, _ = self.p_sample(
+                batch_obj=batch_obj,
+                x_t=x_t,
+                cond_node_emb=cond_node_emb,
+                graph_emb=graph_emb,
+                t=t_graph,
+            )
+            if return_traj:
+                traj.append(x_t.detach().cpu())
+
+        return (x_t, traj) if return_traj else x_t
+
+    # =========================
+    #  Public APIs
+    # =========================
+
+    @torch.no_grad()
+    def sample(
+        self,
+        batch_obj,
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        return_traj: bool = False,
+    ):
+        """
+        纯噪声生成：x_T ~ N(0,I) -> x0
+        """
+        return self.p_sample_loop(
+            batch_obj=batch_obj,
+            cond_node_emb=cond_node_emb,
+            graph_emb=graph_emb,
+            x_T=None,
+            return_traj=return_traj,
+        )
+
+    @torch.no_grad()
+    def reconstruct_from_noisy(
+        self,
+        batch_obj,
+        x_t: torch.Tensor,            # 给定某个噪声步的坐标 [N,3]
+        t_start: int,                 # 从 t_start 开始反推到 0
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        return_traj: bool = False,
+    ):
+        device = batch_obj.x.device
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+
+        x_cur = x_t
+        if self.center_pos_mode != "none":
+            x_cur, _, _ = center_pos_mol(x_cur, batch_id, mode=self.center_pos_mode)
+
+        traj = []
+        for step in reversed(range(t_start + 1)):
+            t_graph = torch.full((B,), step, device=device, dtype=torch.long)
+            x_cur, _ = self.p_sample(
+                batch_obj=batch_obj,
+                x_t=x_cur,
+                cond_node_emb=cond_node_emb,
+                graph_emb=graph_emb,
+                t=t_graph,
+            )
+            if return_traj:
+                traj.append(x_cur.detach().cpu())
+
+        return (x_cur, traj) if return_traj else x_cur
+
+    @torch.no_grad()
+    def reconstruct_from_clean(
+        self,
+        batch_obj,
+        x0: torch.Tensor,             # 干净坐标 [N,3]
+        t_start: int,
+        cond_node_emb: torch.Tensor,
+        graph_emb: torch.Tensor,
+        return_traj: bool = False,
+    ):
+        """
+        先 q_sample 加噪到 x_t_start，然后反推回 x0
+        """
+        batch_id = batch_obj.batch
+        B = int(batch_id.max().item()) + 1
+        t_graph = torch.full((B,), t_start, device=x0.device, dtype=torch.long)
+
+        x0c = x0
+        if self.center_pos_mode != "none":
+            x0c, _, _ = center_pos_mol(x0c, batch_id, mode=self.center_pos_mode)
+
+        x_t, _ = self.q_pos_sample(x0c, t_graph, batch_id)
+        return self.reconstruct_from_noisy(
+            batch_obj=batch_obj,
+            x_t=x_t,
+            t_start=t_start,
+            cond_node_emb=cond_node_emb,
+            graph_emb=graph_emb,
+            return_traj=return_traj,
+        )
 
 
 def extract(coef, t, batch):

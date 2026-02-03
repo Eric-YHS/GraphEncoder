@@ -5,11 +5,8 @@ import sys
 from pathlib import Path
 import time
 
-# ====== [新增] ======
 import logging
-import re
 from glob import glob
-# ====================
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -20,184 +17,15 @@ import torch
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
-from sklearn.metrics import roc_auc_score
-from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader as TorchDataLoader
-from torch_geometric.transforms import Compose
-from tqdm.auto import tqdm
-from torch.utils.data import random_split
-from functools import partial
-
 import utils.misc as misc
-import utils.train as utils_train
-import utils.transforms as trans
-from utils.data import CollateWithSPDLmdb
-from preprocess import get_pcqm4m_dataset
-from models import GraphGPSEncoder, GraphGPSEncoder_CLS, GraphGPSEncoder_CLS_GraphormerSPD, GraphGPSEncoder_CLS_GPSSPD
-from models import MolPosDiffusion, MolPosDiffusion_condition, MolPosDiffusion_cat
+from utils.builder import build_encoder, build_diffusion, build_datasetLoader, build_logger
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
-from ZINC_preprocess import Zinc20_3D_LMDBDataset
 
-def build_datasetLoader(config, logger):
-    logger.info('Loading dataset...')
-    if config.data.name == "ZINC":
-        ds = Zinc20_3D_LMDBDataset(config.data.path, compressed=False)
-        n = len(ds)
-        logger.info(f"datasets['train'] size (filtered): {n}")
-        n_train = int(0.9 * n)
-        n_val = int(0.09 * n)
-        n_test = n - n_train - n_val
-
-        train_diff, val_diff, test_diff = random_split(
-            ds,
-            [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(2025)
-        )
-    elif config.data.name == "PCQM4M":
-
-        datasets = get_pcqm4m_dataset(
-            root=config.data.path,
-            sdf_path=os.path.join(config.data.path, "pcqm4m-v2", "pcqm4m-v2-train.sdf"),
-            build_3d_cache_if_missing=False,
-            mapping_mode="order",
-            max_mols=None,
-            map_size=1 << 40,
-            build_spd_cache_if_missing=True,
-            spd_max_dist=int(config.encoder.spd_max_dist),
-        )
-        spd_lmdb_path = datasets["spd_lmdb_path"]
-        assert spd_lmdb_path is not None, "spd_lmdb_path is None; SPD cache missing and not built."
-
-        datasets_diffusion = datasets["train"]
-        n = len(datasets_diffusion)
-        logger.info(f"datasets['train'] size (filtered): {n}")
-
-        n_train = int(0.9 * n)
-        n_val = int(0.09 * n)
-        n_test = n - n_train - n_val
-
-        train_diff, val_diff, test_diff = random_split(
-            datasets_diffusion,
-            [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(2025)
-        )
-    else:
-        raise ValueError("dataset name error")
-
-    collate_fn = CollateWithSPDLmdb(spd_lmdb_path, spd_max_dist=int(config.encoder.spd_max_dist))
-    train_loader = TorchDataLoader(
-        train_diff,
-        batch_size=config.train.batch_size,
-        shuffle=True,
-        num_workers=config.train.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
-
-    val_loader = TorchDataLoader(
-        val_diff,
-        batch_size=config.train.batch_size,
-        shuffle=False,
-        num_workers=config.train.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
-
-    test_loader = TorchDataLoader(
-        test_diff,
-        batch_size=config.train.batch_size,
-        shuffle=False,
-        num_workers=config.train.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
-
-    train_iterator = utils_train.inf_iterator(train_loader)
-
-    return train_loader, val_loader, test_loader, train_iterator
-    
-
-def build_encoder(cfg,device):
-    cfg_encoder = cfg.encoder
-    if cfg_encoder.name == 'normal':
-        encoder = GraphGPSEncoder(
-            cfg_encoder,
-            node_in_dim=cfg.data.node_in_dim,
-            edge_in_dim=cfg.data.edge_in_dim
-        ).to(device)
-    elif cfg_encoder.name == 'cls':
-        encoder = GraphGPSEncoder_CLS(
-            cfg_encoder,
-            node_in_dim=cfg.data.node_in_dim,
-            edge_in_dim=cfg.data.edge_in_dim
-        ).to(device)
-    elif cfg_encoder.name == 'cls_graphormer':
-        encoder = GraphGPSEncoder_CLS_GraphormerSPD(
-            cfg_encoder,
-            node_in_dim=cfg.data.node_in_dim,
-            edge_in_dim=cfg.data.edge_in_dim
-        ).to(device)
-    elif cfg_encoder.name == 'cls_gps':
-        encoder = GraphGPSEncoder_CLS_GPSSPD(
-            cfg_encoder,
-            node_in_dim=cfg.data.node_in_dim,
-            edge_in_dim=cfg.data.edge_in_dim
-        ).to(device)
-    else:
-        raise ValueError("encoder name error!")
-    return encoder
-
-def build_diffusion(cfg, device):
-    cfg_model = cfg.model
-    if cfg_model.model_type == 'uni_o2':
-        diffusion = MolPosDiffusion(
-                cfg_model,
-                node_in_dim=cfg.data.node_in_dim,
-                cond_dim=cfg.encoder.hidden_dim
-            ).to(device)
-    elif cfg_model.model_type == 'uni_o2_condition':
-        diffusion = MolPosDiffusion_condition(
-                    cfg_model,
-                    node_in_dim=cfg.data.node_in_dim,
-                    cond_dim=cfg.encoder.hidden_dim
-                ).to(device)
-    elif cfg_model.model_type == 'uni_o2_cat':
-        diffusion = MolPosDiffusion_cat(
-                    cfg_model,
-                    node_in_dim=cfg.data.node_in_dim,
-                    cond_dim=cfg.encoder.hidden_dim
-                ).to(device)
-    else:
-        raise ValueError("model type error")
-    return diffusion
-
-def update_config_with_args(config, args):
-    if args.encoder_layers is not None:
-        config.encoder.num_layers = int(args.encoder_layers)
-    if args.model_layers is not None:
-        config.model.num_layers = int(args.model_layers)
-    if args.encoder_name is not None:
-        config.encoder.name = args.encoder_name
-    if args.denoiser_name is not None:
-        config.model.model_type = args.denoiser_name
-
-    return config
-
-def update_config_with_data(config, batch):
-    config.data.node_in_dim = int(batch.x.shape[1])
-
-    if getattr(batch, "edge_attr", None) is None:
-        edge_in_dim = 0
-    else:
-        edge_in_dim = int(batch.edge_attr.shape[1])
-    config.data.edge_in_dim = edge_in_dim
-    config.model.edge_feat_dim = edge_in_dim + 2
-
-    return config
 
 
 def _to_device_and_cast(batch, device):
@@ -211,24 +39,6 @@ def _to_device_and_cast(batch, device):
         batch.edge_attr = batch.edge_attr.float()
 
     return batch
-
-
-def _get_node_emb(encoder_out) -> torch.Tensor:
-    if torch.is_tensor(encoder_out):
-        return encoder_out
-
-    if isinstance(encoder_out, (tuple, list)):
-        assert len(encoder_out) >= 1
-        return encoder_out[0]
-
-    if isinstance(encoder_out, dict):
-        for k in ["node_emb", "node_repr", "h_node", "node", "node_out"]:
-            if k in encoder_out:
-                return encoder_out[k]
-        raise KeyError(f"Cannot find node embedding key in encoder_out: {list(encoder_out.keys())}")
-
-    raise TypeError(f"Unsupported encoder_out type: {type(encoder_out)}")
-
 
 def forward_encoder(encoder: nn.Module, batch):
     try:
@@ -313,42 +123,6 @@ def find_log_file_to_append(log_dir: str) -> str:
     # 没找到就新建一个默认文件名
     return os.path.join(log_dir, "train.log")
 
-
-def setup_logger(log_dir: str, resume: bool, name: str = "train") -> logging.Logger:
-    os.makedirs(log_dir, exist_ok=True)
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    # 清理旧 handler（避免重复打印）
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-        try:
-            h.close()
-        except Exception:
-            pass
-
-    fmt = logging.Formatter(fmt="%(asctime)s | %(levelname)s | %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-
-    # console
-    sh = logging.StreamHandler(stream=sys.stdout)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-
-    # file (append / write)
-    log_file = os.path.join(log_dir, "log.txt")
-    fh = logging.FileHandler(log_file, mode="a" if resume else "w")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    logger.info(f"Logger file: {log_file} (mode={'append' if resume else 'write'})")
-    return logger
-# =====================================
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
@@ -384,44 +158,16 @@ if __name__ == '__main__':
     config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
     misc.seed_all(config.train.seed)
     device = torch.device(args.device)
-    config = update_config_with_args(config, args)
+    config = misc.update_config_with_args(config, args)
 
     # Logging / dirs
-    tag = f"en{config.encoder.num_layers}_de{config.model.num_layers}_e_{config.encoder.name}_d_{config.model.model_type}"
-    if args.resume:
-        if args.resume_log_dir is None or args.resume_ckpt is None:
-            raise ValueError("When --resume, you must provide --resume_log_dir and --resume_ckpt")
-
-        log_dir = args.resume_log_dir
-        ckpt_path = resolve_ckpt_path(args.resume_ckpt)
-        ckpt_dir = os.path.dirname(ckpt_path) if os.path.isfile(ckpt_path) else args.resume_ckpt
-        os.makedirs(log_dir, exist_ok=True)
-        os.makedirs(ckpt_dir, exist_ok=True)
-    else:
-        run_time = time.localtime()
-        log_ts  = time.strftime('%Y_%m_%d__%H_%M_%S', run_time)  # 给 log_dir 用
-        ckpt_ts = time.strftime('%Y%m%d-%H%M%S', run_time) 
-        log_dir = os.path.join('logs_diffusion', f"{log_ts}_{tag}")
-        ckpt_dir = os.path.join('outputs', 'checkpoints', config_name, tag + f"_{ckpt_ts}")
-        os.makedirs(log_dir, exist_ok=True)
-        os.makedirs(ckpt_dir, exist_ok=True)
-
-    vis_dir = os.path.join(log_dir, 'vis')
-    os.makedirs(vis_dir, exist_ok=True)
-    logger = setup_logger(log_dir, resume=args.resume, name='train')
-    writer = SummaryWriter(log_dir)
-    logger.info(args)
-    logger.info(config)
-
-    if not args.resume:
-        shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
-        shutil.copytree('./models', os.path.join(log_dir, 'models'))
+    logger, writer, log_dir, ckpt_dir = build_logger(args, config, train=True)
 
     # Datasets and loaders
     train_loader, val_loader, test_loader, train_iterator = build_datasetLoader(config, logger)
 
     batch0 = next(train_iterator)
-    config = update_config_with_data(config, batch0)
+    config = misc.update_config_with_data(config, batch0)
 
     logger.info(f"Auto inferred dims: node_in_dim={config.data.node_in_dim}, "
                 f"edge_in_dim={config.data.edge_in_dim}, model.edge_feat_dim={config.model.edge_feat_dim}")
