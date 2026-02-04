@@ -464,10 +464,10 @@ def get_pcqm4m_dataset(
         spd_data_mdb = os.path.join(spd_lmdb_path, "data.mdb")
 
         if not os.path.exists(spd_data_mdb):
-            from utils.data import build_spd_lmdb  # 你的实现位置
+            from utils.data import build_spd_edge_lmdb  # 你的实现位置
             # ✅ 只对真正会被训练用到的 idx 构建（filtered_train_idx）
             idx_list = [int(i) for i in filtered_train_idx]
-            build_spd_lmdb(
+            build_spd_edge_lmdb(
                 pyg_dataset=pyg_dataset,
                 indices=idx_list,
                 lmdb_path=spd_lmdb_path,

@@ -10,3 +10,5 @@
 2026-02-03 16:14:05 | INFO | split=test mode=reconstruct n_samples=10 thr=0.5 bs=64
 2026-02-03 16:36:15 | INFO | [eval] batch=1/4 mols=1024 (+1024) avg_batch_time=1324.24s COV-R=nan MAT-R=nan COV-P=nan MAT-P=nan | gpu_mem(alloc/reserv)=0.03/1.61GB
 2026-02-03 16:36:15 | INFO | [batch stats] num_nodes: min=5 p50=15 max=20
+2026-02-03 17:24:13 | INFO | [DONE] saved: eval_covmat.json
+2026-02-03 17:24:13 | INFO | {'COV-R_mean': 0.025961839224272757, 'MAT-R_mean': 1.362930140651378, 'COV-P_mean': 0.002658742571160463, 'MAT-P_mean': 2.537899018451486, 'COV-R_median': 0.0, 'MAT-R_median': 1.367077698239248, 'COV-P_median': 0.0, 'MAT-P_median': 2.5310400504502546}

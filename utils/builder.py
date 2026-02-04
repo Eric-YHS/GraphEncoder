@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader as TorchDataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from preprocess import get_pcqm4m_dataset
-from .data import CollateWithSPDLmdb
+from .data import CollateWithSPDLmdb, CollateWithSPDEdgeLmdb
 from .train import inf_iterator
 from .ZINC_preprocess import Zinc20_3D_LMDBDataset
 from models import GraphGPSEncoder, GraphGPSEncoder_CLS, GraphGPSEncoder_CLS_GraphormerSPD, GraphGPSEncoder_CLS_GPSSPD
@@ -145,7 +145,7 @@ def build_datasetLoader(config, logger, test_scale = None):
     else:
         raise ValueError("dataset name error")
 
-    collate_fn = CollateWithSPDLmdb(spd_lmdb_path, spd_max_dist=int(config.encoder.spd_max_dist))
+    collate_fn = CollateWithSPDEdgeLmdb(spd_lmdb_path, spd_max_dist=int(config.encoder.spd_max_dist))
     train_loader = TorchDataLoader(
         train_diff,
         batch_size=config.train.batch_size,

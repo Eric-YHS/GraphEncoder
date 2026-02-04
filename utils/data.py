@@ -4,6 +4,9 @@ from rdkit import Chem
 from rdkit.Chem.rdchem import BondType
 from rdkit.Chem import ChemicalFeatures
 from rdkit import RDConfig
+from collections import deque
+import numpy as np
+import torch
 
 ATOM_FAMILIES = ['Acceptor', 'Donor', 'Aromatic', 'Hydrophobe', 'LumpedHydrophobe', 'NegIonizable', 'PosIonizable',
                  'ZnBinder']
@@ -327,7 +330,105 @@ def compute_spd_matrix(edge_index: torch.Tensor, num_nodes: int, max_dist: int) 
                     q.append(v)
     return dist
 
+
+def compute_spd_and_edge_input(
+    edge_index: torch.Tensor,   # [2,E]
+    edge_attr: torch.Tensor,    # [E,3]
+    num_nodes: int,
+    max_dist: int,
+    bond_dims,
+    num_edge_types: int,
+):
+    """
+    返回：
+      spd: uint8 [n,n]，值域 [0, max_dist+1]，>max_dist 视作 max_dist+1
+      edge_input: uint16 [n,n,max_dist]，每跳的 edge_type_id（0=pad）
+    """
+    n = num_nodes
+    INF = max_dist + 1
+
+    src = edge_index[0].tolist()
+    dst = edge_index[1].tolist()
+
+    edge_type = pack_edge_type(edge_attr, bond_dims).cpu().tolist()  # [E] in 1..num_edge_types
+
+    # 邻接表：无向处理（如果 edge_index 本身已有双向，重复也没事）
+    adj = [[] for _ in range(n)]
+    for u, v, et in zip(src, dst, edge_type):
+        if 0 <= u < n and 0 <= v < n:
+            adj[u].append((v, et))
+            adj[v].append((u, et))
+
+    spd = np.full((n, n), INF, dtype=np.uint8)
+    edge_input = np.zeros((n, n, max_dist), dtype=np.uint16)
+
+    for s in range(n):
+        # BFS arrays
+        dist = np.full(n, INF, dtype=np.int16)
+        pred_node = np.full(n, -1, dtype=np.int16)
+        pred_edge = np.zeros(n, dtype=np.uint16)
+
+        dist[s] = 0
+        q = deque([s])
+
+        while q:
+            u = q.popleft()
+            du = int(dist[u])
+            if du >= max_dist:     # ✅ 关键：超过 max_dist 不再扩展
+                continue
+            nd = du + 1
+            for v, et in adj[u]:
+                if dist[v] > nd:
+                    dist[v] = nd
+                    pred_node[v] = u
+                    pred_edge[v] = et
+                    q.append(v)
+
+        # 写 SPD 行
+        # dist>max_dist 的仍然保持 INF
+        dist_clamped = np.minimum(dist, INF).astype(np.uint8)
+        spd[s, :] = dist_clamped
+        spd[s, s] = 0
+
+        # 写 edge_input[s, t, :]
+        for t in range(n):
+            dt = int(dist[t])
+            if t == s or dt == INF or dt == 0 or dt > max_dist:
+                continue
+
+            # 回溯 t -> s 收集边类型
+            edges = []
+            cur = t
+            steps = 0
+            while cur != s and cur != -1 and steps < max_dist:
+                edges.append(int(pred_edge[cur]))
+                cur = int(pred_node[cur])
+                steps += 1
+
+            if cur != s:
+                # 理论上不会发生（除非图里异常或 pred 断裂）
+                continue
+
+            edges.reverse()  # hop 顺序：从 s 出发
+            L = min(len(edges), max_dist)
+            if L > 0:
+                edge_input[s, t, :L] = np.asarray(edges[:L], dtype=np.uint16)
+
+    return spd, edge_input
+
 # ========== LMDB pack/unpack ==========
+def pack_edge_type(edge_attr: torch.Tensor, bond_dims) -> torch.Tensor:
+    """
+    edge_attr: [E,3]，每列是离散 id
+    返回 edge_type_id: [E]，范围 1..num_edge_types，0 留给 padding
+    """
+    d0, d1, d2 = bond_dims
+    a0 = edge_attr[:, 0].long()
+    a1 = edge_attr[:, 1].long()
+    a2 = edge_attr[:, 2].long()
+    edge_type = a0 + d0 * (a1 + d1 * a2)  # 0..num_edge_types-1
+    return edge_type + 1                  # 1..num_edge_types
+
 def spd_pack(spd_uint8: np.ndarray) -> bytes:
     """
     format:
@@ -345,7 +446,135 @@ def spd_unpack(blob: bytes) -> np.ndarray:
     arr = np.frombuffer(blob[2:], dtype=np.uint8)
     return arr.reshape((n, n))
 
+def spd_edge_pack(spd_uint8: np.ndarray, edge_input_u16: np.ndarray, max_dist: int, num_edge_types: int) -> bytes:
+    """
+    format (little endian):
+      uint16 n
+      uint16 max_dist
+      uint32 num_edge_types
+      uint8  spd_flat (n*n bytes)
+      uint16 edge_input_flat (n*n*max_dist*2 bytes)
+    """
+    n = spd_uint8.shape[0]
+    assert spd_uint8.shape == (n, n)
+    assert edge_input_u16.shape == (n, n, max_dist)
+
+    header = (
+        np.array([n], dtype=np.uint16).tobytes() +
+        np.array([max_dist], dtype=np.uint16).tobytes() +
+        np.array([num_edge_types], dtype=np.uint32).tobytes()
+    )
+    payload_spd = spd_uint8.reshape(-1).tobytes()
+    payload_edge = edge_input_u16.reshape(-1).tobytes()
+    return header + payload_spd + payload_edge
+
+def spd_edge_unpack(blob: bytes):
+    n = np.frombuffer(blob[:2], dtype=np.uint16)[0].item()
+    max_dist = np.frombuffer(blob[2:4], dtype=np.uint16)[0].item()
+    num_edge_types = np.frombuffer(blob[4:8], dtype=np.uint32)[0].item()
+
+    spd_bytes = n * n
+    spd_start = 8
+    spd_end = spd_start + spd_bytes
+    spd = np.frombuffer(blob[spd_start:spd_end], dtype=np.uint8).reshape((n, n))
+
+    edge = np.frombuffer(blob[spd_end:], dtype=np.uint16).reshape((n, n, max_dist))
+    return spd, edge, max_dist, num_edge_types
+
+
 # ========== Builder ==========
+def build_spd_edge_lmdb(
+    pyg_dataset,
+    indices: Iterable[int],
+    lmdb_path: str,
+    spd_max_dist: int,
+    map_size: int = (1 << 40),
+    max_mols: Optional[int] = None,
+    verbose_every: int = 10000,
+):
+    """
+    读取 pyg_dataset[idx] 的 edge_index / edge_attr / num_nodes，
+    计算：
+      - SPD: uint8 [n,n] in [0, max_dist+1]，>max_dist 记为 max_dist+1
+      - edge_input: uint16 [n,n,max_dist]，每跳的 edge_type_id（0=pad）
+    并写入 LMDB。
+    key = str(idx)
+    """
+    os.makedirs(lmdb_path, exist_ok=True)
+    data_mdb = os.path.join(lmdb_path, "data.mdb")
+    if os.path.exists(data_mdb):
+        print(f"[SPD+EDGE-LMDB] exists: {data_mdb}, skip build.")
+        return
+
+    # ✅ 用 OGB 的 bond feature dims 来做稳定的 edge_type 打包（推荐）
+    try:
+        from ogb.utils.features import get_bond_feature_dims
+        bond_dims = get_bond_feature_dims()  # len=3
+        if len(bond_dims) != 3:
+            raise ValueError(f"Expected 3 bond dims, got {bond_dims}")
+        d0, d1, d2 = [int(x) for x in bond_dims]
+        num_edge_types = d0 * d1 * d2
+    except Exception as e:
+        raise RuntimeError(
+            "Cannot import ogb.utils.features.get_bond_feature_dims(). "
+            "Please ensure ogb is installed, or provide a fixed bond_dims."
+        ) from e
+
+    env = lmdb.open(
+        lmdb_path,
+        subdir=True,
+        map_size=map_size,
+        readonly=False,
+        lock=True,
+        readahead=False,
+        meminit=False,
+        max_dbs=1,
+    )
+
+    count = 0
+    with env.begin(write=True) as txn:
+        for k, idx in enumerate(indices):
+            if max_mols is not None and count >= max_mols:
+                break
+
+            data = pyg_dataset[int(idx)]
+            n = int(data.num_nodes)
+
+            ei = data.edge_index
+            ea = data.edge_attr
+            if not torch.is_tensor(ei):
+                ei = torch.as_tensor(ei, dtype=torch.long)
+            else:
+                ei = ei.long()
+            if not torch.is_tensor(ea):
+                ea = torch.as_tensor(ea, dtype=torch.long)
+            else:
+                ea = ea.long()
+
+            if ea.size(-1) != 3:
+                raise ValueError(f"edge_attr last dim must be 3, got {ea.shape} at idx={idx}")
+
+            spd, edge_input = compute_spd_and_edge_input(
+                edge_index=ei,
+                edge_attr=ea,
+                num_nodes=n,
+                max_dist=int(spd_max_dist),
+                bond_dims=(d0, d1, d2),
+                num_edge_types=num_edge_types,
+            )
+
+            blob = spd_edge_pack(spd, edge_input, max_dist=int(spd_max_dist), num_edge_types=num_edge_types)
+            txn.put(str(int(idx)).encode("utf-8"), blob)
+
+            count += 1
+            if verbose_every and (count % verbose_every == 0):
+                print(f"[SPD+EDGE-LMDB] built {count} molecules...")
+
+    env.sync()
+    env.close()
+    print(f"[SPD+EDGE-LMDB] done. total={count} saved at {lmdb_path}")
+
+
 def build_spd_lmdb(
     pyg_dataset,
     indices: Iterable[int],
@@ -454,3 +683,73 @@ class CollateWithSPDLmdb:
         return batch
 
 
+class CollateWithSPDEdgeLmdb:
+    """
+    从 LMDB 读取：
+      - spd: uint8 [n,n] in [0, spd_max_dist+1]
+      - edge_input: uint16 [n,n,spd_max_dist] (0=pad, 1..num_edge_types)
+    然后 pad 成 batch dense：
+      - batch.spatial_pos_dense: [B,L,L] long
+      - batch.edge_input_dense:  [B,L,L,spd_max_dist] long
+    """
+    def __init__(self, spd_lmdb_path: str, spd_max_dist: int):
+        self.spd_lmdb_path = spd_lmdb_path
+        self.spd_max_dist = int(spd_max_dist)
+        self._env = None
+
+    def _get_env(self):
+        if self._env is None:
+            self._env = lmdb.open(
+                self.spd_lmdb_path,
+                subdir=True,
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+                max_dbs=1,
+            )
+        return self._env
+
+    def __call__(self, data_list):
+        batch = Batch.from_data_list(data_list)
+
+        sizes = [int(d.num_nodes) for d in data_list]
+        B = len(sizes)
+        L = max(sizes) if B > 0 else 0
+        INF = self.spd_max_dist + 1
+
+        # pad SPD
+        spd_dense = torch.full((B, L, L), INF, dtype=torch.long)
+
+        # pad edge_input
+        edge_input_dense = torch.zeros((B, L, L, self.spd_max_dist), dtype=torch.long)
+
+        env = self._get_env()
+        with env.begin(write=False) as txn:
+            for i, d in enumerate(data_list):
+                if not hasattr(d, "idx"):
+                    raise ValueError(
+                        "Data object missing .idx (global dataset index). "
+                        "Please set data.idx in Dataset.__getitem__."
+                    )
+                idx = int(d.idx)
+                blob = txn.get(str(idx).encode("utf-8"))
+                if blob is None:
+                    raise KeyError(f"SPD+EDGE not found in LMDB for idx={idx}. Did you build the SPD+EDGE cache?")
+
+                # ✅ 新 unpack：同时读 spd 和 edge_input
+                spd, edge_in, md, _ = spd_edge_unpack(blob)
+
+                if int(md) != self.spd_max_dist:
+                    raise ValueError(
+                        f"LMDB max_dist={md} != collate spd_max_dist={self.spd_max_dist}. "
+                        "Please rebuild cache or align config."
+                    )
+
+                n = spd.shape[0]
+                spd_dense[i, :n, :n] = torch.from_numpy(spd.astype(np.int64))
+                edge_input_dense[i, :n, :n, :] = torch.from_numpy(edge_in.astype(np.int64))
+
+        batch.spatial_pos_dense = spd_dense
+        batch.edge_input_dense = edge_input_dense
+        return batch

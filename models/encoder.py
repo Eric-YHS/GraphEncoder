@@ -551,11 +551,13 @@ class GraphGlobalSelfAttention_CLS_Graphormer(nn.Module):
         num_heads: int,
         attn_dropout: float = 0.0,
         spd_max_dist: int = 8,
+        num_edge_types: int = 0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.spd_max_dist = spd_max_dist
+        self.num_edge_types = num_edge_types
 
         self.mha = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -566,12 +568,20 @@ class GraphGlobalSelfAttention_CLS_Graphormer(nn.Module):
         self.spatial_emb = nn.Embedding(spd_max_dist + 3, num_heads, padding_idx=0)
         self.graph_token_virtual_distance = nn.Embedding(1, num_heads)
 
+        vocab = (self.spd_max_dist + 1) * (self.num_edge_types + 1)
+        self.edge_path_emb = nn.Embedding(vocab, num_heads, padding_idx=0)
+
+        # hop ids 1..max_dist (buffer)
+        hop = torch.arange(1, self.spd_max_dist + 1, dtype=torch.long)
+        self.register_buffer("_hop_ids", hop, persistent=False)
+
     def forward(
         self,
         h_dense: torch.Tensor,                 # [B,L,D]
         mask: torch.Tensor,              # [B,L]
         batch: torch.Tensor,             # [N]
         spatial_pos: torch.Tensor,       # [B, L, L] (SPD indices, 0..spd_max+1)
+        edge_input: torch.Tensor,        # [B, L, L, max_dist] (edge type ids)
         cls: torch.Tensor,               # [B, D]
     ):
         B, L, D = h_dense.shape
@@ -590,7 +600,7 @@ class GraphGlobalSelfAttention_CLS_Graphormer(nn.Module):
         if spatial_pos.dtype != torch.long:
             spatial_pos = spatial_pos.long()
 
-        # [CLS; nodes]
+        ########### [CLS; nodes]
         cls_tok = cls.unsqueeze(1)                    # [B,1,D]
         h_cat = torch.cat([cls_tok, h_dense], dim=1)  # [B,L+1,D]
 
@@ -599,20 +609,37 @@ class GraphGlobalSelfAttention_CLS_Graphormer(nn.Module):
         tok_valid = torch.cat([cls_valid, mask], dim=1)     # [B,L+1]
         key_padding_mask = ~tok_valid                       # [B,L+1], True=pad
 
-        # spatial_pos: [B,L,L]，值域 0..spd_max+1
+        ########### spatial_pos: [B,L,L]，值域 0..spd_max+1
         spd = spatial_pos.clamp(0, self.spd_max_dist + 1)
         spd = spd + 1
         pair_valid = mask.unsqueeze(1) & mask.unsqueeze(2)  # [B,L,L]
         spd = spd.masked_fill(~pair_valid, 0)
 
-
-        # 扩展 CLS：CLS 行列 SPD=0（不加任何 bias）
         spd_full = spd.new_zeros((B, L + 1, L + 1))       # [B,L+1,L+1]
         spd_full[:, 1:, 1:] = spd                         # 只对 nodes 部分加 SPD
 
         # embedding -> per-head bias
         bias = self.spatial_emb(spd_full)                 # [B,L+1,L+1,H]
         bias = bias.permute(0, 3, 1, 2).contiguous()      # [B,H,L+1,L+1]
+
+        ########### Path/edge bias
+        hop = self._hop_ids.view(1, 1, 1, self.spd_max_dist)
+        M = self.num_edge_types + 1
+        # idx: [B,L,L,max_dist]
+        idx = hop * M + edge_input
+        valid = edge_input != 0
+        idx = idx.masked_fill(~valid, 0)
+
+        # lookup: [B,L,L,max_dist,H]
+        edge_bias = self.edge_path_emb(idx)  # per-head bias [B,L,L,max_dist,H]
+        valid_f = valid.unsqueeze(-1).to(edge_bias.dtype) # [B,L,L,max_dist,1]
+        denom = valid_f.sum(dim=3).clamp(min=1.0)         # [B,L,L,1]
+        edge_bias = (edge_bias * valid_f).sum(dim=3) / denom  # [B,L,L,H]
+
+        # add into nodes×nodes block only (CLS excluded)
+        bias[:, :, 1:, 1:] = bias[:, :, 1:, 1:] + edge_bias.permute(0, 3, 1, 2).contiguous()
+
+
         t = self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
         bias[:, :, 1:, 0] = bias[:, :, 1:, 0] + t   # nodes -> CLS
         bias[:, :, 0, :]  = bias[:, :, 0, :]  + t   # CLS  -> all (含 CLS->CLS)
@@ -644,10 +671,12 @@ class GraphGPSBlock_CLS_GraphormerSPD(nn.Module):
         dropout: float = 0.1,
         attn_dropout: float = 0.0,
         spd_max_dist: int = 8,
+        num_edge_types: int = 0,
     ):
         super().__init__()
         self.dropout = dropout
         self.hidden_dim = hidden_dim
+        self.num_edge_types = num_edge_types
 
         nn_local = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -661,6 +690,7 @@ class GraphGPSBlock_CLS_GraphormerSPD(nn.Module):
             num_heads=num_heads,
             attn_dropout=attn_dropout,
             spd_max_dist=spd_max_dist,
+            num_edge_types=num_edge_types,
         )
 
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -680,6 +710,7 @@ class GraphGPSBlock_CLS_GraphormerSPD(nn.Module):
         edge_attr: torch.Tensor,        # [E, edge_dim]
         batch: torch.Tensor,            # [N]
         spatial_pos: torch.Tensor,      # [B, L, L]
+        edge_input: torch.Tensor,       # [B, L, L, max_dist]
         cls: torch.Tensor,              # [B, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -709,6 +740,7 @@ class GraphGPSBlock_CLS_GraphormerSPD(nn.Module):
             mask=mask,
             batch=batch,
             spatial_pos=spatial_pos,
+            edge_input=edge_input,
             cls=cls,
         )  # [B,L+1,D]
         attn_out_cat = F.dropout(attn_out_cat, p=self.dropout, training=self.training)
@@ -754,6 +786,14 @@ class GraphGPSEncoder_CLS_GraphormerSPD(nn.Module):
 
         self.degree_enc = DegreeEncoder(cfg.max_degree, cfg.hidden_dim) if cfg.use_degree else None
 
+        if hasattr(cfg, "num_edge_types") and int(cfg.num_edge_types) > 0:
+            num_edge_types = int(cfg.num_edge_types)
+        else:
+            from ogb.utils.features import get_bond_feature_dims
+            dims = get_bond_feature_dims()  # len=3
+            num_edge_types = int(dims[0]) * int(dims[1]) * int(dims[2])
+        self.num_edge_types = num_edge_types
+
         self.blocks = nn.ModuleList([
             GraphGPSBlock_CLS_GraphormerSPD(
                 hidden_dim=cfg.hidden_dim,
@@ -762,6 +802,7 @@ class GraphGPSEncoder_CLS_GraphormerSPD(nn.Module):
                 dropout=cfg.dropout,
                 attn_dropout=cfg.attn_dropout,
                 spd_max_dist=cfg.spd_max_dist,
+                num_edge_types=num_edge_types,
             )
             for _ in range(cfg.num_layers)
         ])
@@ -777,6 +818,8 @@ class GraphGPSEncoder_CLS_GraphormerSPD(nn.Module):
         self._expect_edge_dim = edge_in_dim
 
         self.spd_max_dist = cfg.spd_max_dist
+
+
 
     # ---------- forward ----------
     def forward(self, batch):
@@ -816,6 +859,15 @@ class GraphGPSEncoder_CLS_GraphormerSPD(nn.Module):
         if spatial_pos_dense.dtype != torch.long:
             spatial_pos_dense = spatial_pos_dense.long()
 
+        # edge_input from collate
+        if not hasattr(batch, "edge_input_dense"):
+            raise ValueError("use_spd_bias=True but batch has no edge_input_dense. Did you build SPD+EDGE cache and collate it?")
+        edge_input_dense = batch.edge_input_dense
+        if edge_input_dense is None:
+            raise ValueError("batch.edge_input_dense is None.")
+        if edge_input_dense.dtype != torch.long:
+            edge_input_dense = edge_input_dense.long()
+
 
         # init CLS for each graph
         B = int(batch_id.max().item()) + 1
@@ -829,6 +881,7 @@ class GraphGPSEncoder_CLS_GraphormerSPD(nn.Module):
                 edge_attr=e,
                 batch=batch_id,
                 spatial_pos=spatial_pos_dense,
+                edge_input=edge_input_dense,
                 cls=cls,
             )
 

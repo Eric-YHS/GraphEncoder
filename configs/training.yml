@@ -1,12 +1,13 @@
 data:
   name: PCQM4M # ZINC/PCQM4M
-  path: ./data/PCQM4M
+  path: /mnt2/luyifeng/diff4MoleculeRepresentation/data/PCQM4M
+  # path: ./data/PCQM4M
   # path: /mnt2/luyifeng/ZINC/zinc20_3d_6000000_k1/zinc_confs.lmdb
   node_in_dim: 9
   edge_in_dim: 3
   
 encoder:
-  name: cls_gps # ['normal', 'cls', 'cls_graphormer', 'cls_gps']
+  name: cls_graphormer # ['normal', 'cls', 'cls_graphormer', 'cls_gps']
   hidden_dim: 176
   num_layers: 9
   num_heads: 8

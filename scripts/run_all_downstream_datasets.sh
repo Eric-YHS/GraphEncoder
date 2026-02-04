@@ -75,7 +75,7 @@ trap cleanup INT TERM
 # -------------------------
 # User config (EDIT HERE)
 # -------------------------
-PREPARED_DIR="data/prepared"
+PREPARED_DIR="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared"
 SCRIPT="scripts/downstream_benchmark_port.py"
 
 # GPUs to use (one dataset job gets one GPU; round-robin assignment)

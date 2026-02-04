@@ -1071,6 +1071,7 @@ def build_encoder(cfg,device, node_in_dim, edge_in_dim):
 
 def run_downstream_from_prepared(
     prepared_path: str,
+    prepared_spd_path: str,
     ckpt_path: str,
     encoder_cfg: Any,
     device: torch.device,
@@ -1117,6 +1118,7 @@ def run_downstream_from_prepared(
             batch_size=embed_batch_size,
             num_workers=num_workers,
             spd_max_dist=int(encoder_cfg.spd_max_dist),
+            spd_cache_root=prepared_spd_path,
         )
 
         y = ds.labels.to_numpy(dtype=float)
@@ -1172,7 +1174,9 @@ def run_downstream_from_prepared(
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prepared_path", type=str, required=True,
+    parser.add_argument("--prepared_path", type=str, default="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared/DILI.json",
+                        help="Path to prepared dataset (.json or .joblib), e.g. prepared/DILI.json")
+    parser.add_argument("--prepared_spd_path", type=str, default="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared_spd_cache",
                         help="Path to prepared dataset (.json or .joblib), e.g. prepared/DILI.json")
     parser.add_argument("--ckpt_date", type=str, required=False, default="20260127-143109",
                         help="Path to your training checkpoint best.pt")
@@ -1219,6 +1223,7 @@ def main():
 
     run_downstream_from_prepared(
         prepared_path=args.prepared_path,
+        prepared_spd_path=args.prepared_spd_path,
         ckpt_path=ckpt_path,
         encoder_cfg=encoder_cfg,
         device=device,
