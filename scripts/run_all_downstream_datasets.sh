@@ -79,7 +79,7 @@ PREPARED_DIR="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared"
 SCRIPT="scripts/downstream_benchmark_port.py"
 
 # GPUs to use (one dataset job gets one GPU; round-robin assignment)
-GPUS=(0 1 2 3)            # e.g. (0 1 2 3)
+GPUS=(1 2)            # e.g. (0 1 2 3)
 MAX_PARALLEL=8        # max concurrent dataset jobs per config
                       # 建议 MAX_PARALLEL <= ${#GPUS[@]}，否则同一GPU会被多个任务抢
 
@@ -99,8 +99,6 @@ EXCLUDE_DATASETS=(
 
 )
 
-# Whether to force recompute embeddings (pass --override)
-FORCE_OVERRIDE=0  # 1=add --override, 0=default skip embedding cache if exists
 
 # Reduce warning spam (optional)
 export PYTHONWARNINGS="ignore::UserWarning,ignore::FutureWarning"
@@ -120,10 +118,10 @@ export PYTHONUNBUFFERED=1
 # 你把下面示例改成你自己的 4 组即可
 # -------------------------
 CONFIGS=(
-  "9|5|cls_graphormer|uni_o2_condition|20260127-143109"
-  "9|5|cls_graphormer|uni_o2_cat|20260127-143134"
-  "9|5|cls_gps|uni_o2_condition|20260127-143204"
-  "9|5|cls_gps|uni_o2_cat|20260127-143209"
+  "9|5|cls_graphormer|uni_o2_condition|20260204-163653"
+  "9|5|cls_pearl|uni_o2_condition|20260204-175227"
+  "9|5|cls_pearl|uni_o2_condition|20260204-180020"
+  "9|5|cls_graphormer_pearl|uni_o2_condition|20260204-181909"
 )
 
 # -------------------------
@@ -275,44 +273,26 @@ run_one_dataset_job() {
     echo "  --encoder_name ${encoder_name} \\"
     echo "  --denoiser_name ${denoiser_name} \\"
     echo "  --ckpt_date ${ckpt_date} \\"
-    if [[ "${FORCE_OVERRIDE}" -eq 1 ]]; then
-      echo "  --override \\"
-    fi
     echo "============================================================"
     echo
   } > "${log_path}"
 
-  if [[ "${FORCE_OVERRIDE}" -eq 1 ]]; then
-    CUDA_VISIBLE_DEVICES="${gpu_id}" \
-      python -u "${SCRIPT}" \
-        --prepared_path "${ds_path}" \
-        --device "cuda:0" \
-        --out_dir "${out_dir}" \
-        --model_name "${model_name}" \
-        --embed_bs "${EMBED_BS}" \
-        --num_workers "${NUM_WORKERS}" \
-        --enlayer "${en}" \
-        --delayer "${de}" \
-        --encoder_name "${encoder_name}" \
-        --denoiser_name "${denoiser_name}" \
-        --ckpt_date "${ckpt_date}" \
-        --override >> "${log_path}" 2>&1
-  else
-    CUDA_VISIBLE_DEVICES="${gpu_id}" \
-      python -u "${SCRIPT}" \
-        --prepared_path "${ds_path}" \
-        --device "cuda:0" \
-        --out_dir "${out_dir}" \
-        --model_name "${model_name}" \
-        --embed_bs "${EMBED_BS}" \
-        --num_workers "${NUM_WORKERS}" \
-        --enlayer "${en}" \
-        --delayer "${de}" \
-        --encoder_name "${encoder_name}" \
-        --denoiser_name "${denoiser_name}" \
-        --ckpt_date "${ckpt_date}" \
-        >> "${log_path}" 2>&1
-  fi
+
+  CUDA_VISIBLE_DEVICES="${gpu_id}" \
+    python -u "${SCRIPT}" \
+      --prepared_path "${ds_path}" \
+      --device "cuda:0" \
+      --out_dir "${out_dir}" \
+      --model_name "${model_name}" \
+      --embed_bs "${EMBED_BS}" \
+      --num_workers "${NUM_WORKERS}" \
+      --enlayer "${en}" \
+      --delayer "${de}" \
+      --encoder_name "${encoder_name}" \
+      --denoiser_name "${denoiser_name}" \
+      --ckpt_date "${ckpt_date}" \
+      >> "${log_path}" 2>&1
+
 
   echo "# END $(date)" >> "${log_path}"
 }

@@ -17,7 +17,7 @@ import logging as log
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from collections import deque
-
+from ogb.utils.features import get_bond_feature_dims
 
 import sys
 from pathlib import Path
@@ -43,6 +43,8 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.multioutput import MultiOutputClassifier
 from sklearn.metrics import make_scorer, roc_auc_score
 
+from utils.builder import build_encoder
+
 # ====== optional skfp multioutput auroc (same as benchmark) ======
 try:
     from skfp.metrics import multioutput_auroc_score
@@ -51,8 +53,6 @@ except Exception:
     _HAS_SKFP = False
     multioutput_auroc_score = None
 
-# ====== your encoder import path (as you said) ======
-from models import GraphGPSEncoder, GraphGPSEncoder_CLS, GraphGPSEncoder_CLS_GPSSPD, GraphGPSEncoder_CLS_GraphormerSPD
 
 
 # ============================================================
@@ -308,6 +308,102 @@ def shortest_path_dense_unweighted(num_nodes: int, edge_index: torch.Tensor, inf
                     q.append(nb)
     return dist
 
+def shortest_path_spd_and_edge_input(
+    num_nodes: int,
+    edge_index_undirected: torch.Tensor,  # [2,Eu] CPU
+    edge_type_map: dict,                  # (u,v)->edge_type_id, both dirs filled
+    spd_max_dist: int,
+):
+    """
+    returns:
+      spd: [n,n] uint16, INF=spd_max_dist+1
+      edge_input: [n,n,K] uint16, K=spd_max_dist, 0 padding
+    """
+    n = int(num_nodes)
+    INF = int(spd_max_dist) + 1
+    K = int(spd_max_dist)
+
+    src = edge_index_undirected[0].tolist()
+    dst = edge_index_undirected[1].tolist()
+    adj = [[] for _ in range(n)]
+    for u, v in zip(src, dst):
+        if 0 <= u < n and 0 <= v < n and u != v:
+            adj[u].append(v)
+    for u in range(n):
+        adj[u].sort()
+
+    spd = np.full((n, n), INF, dtype=np.uint16)
+    edge_input = np.zeros((n, n, K), dtype=np.uint16)
+
+    for s in range(n):
+        dist = [INF] * n
+        parent = [-1] * n
+        dist[s] = 0
+        q = deque([s])
+
+        while q:
+            u = q.popleft()
+            du = dist[u]
+            if du >= INF:
+                continue
+            nd = du + 1
+            if nd > INF:
+                continue
+            for v in adj[u]:
+                if dist[v] > nd:
+                    dist[v] = nd
+                    parent[v] = u
+                    q.append(v)
+
+        spd[s, :] = np.asarray(dist, dtype=np.uint16)
+
+        # reconstruct one shortest path (BFS tree path)
+        for t in range(n):
+            d = dist[t]
+            if d <= 0 or d > K or d >= INF:
+                continue
+
+            edges = []
+            cur = t
+            while cur != s:
+                p = parent[cur]
+                if p < 0:
+                    edges = []
+                    break
+                edges.append((p, cur))
+                cur = p
+            edges.reverse()
+
+            for k, (u, v) in enumerate(edges):
+                edge_input[s, t, k] = np.uint16(edge_type_map.get((u, v), 0))
+
+    return spd, edge_input
+def pack_edge_type_id(edge_attr: torch.Tensor) -> torch.Tensor:
+    """
+    edge_attr: [E,3] long
+    return: edge_type_id [E] long, in [1..num_edge_types], 0 reserved for padding.
+    """
+    dims = get_bond_feature_dims()  # len=3
+    d0, d1, d2 = int(dims[0]), int(dims[1]), int(dims[2])
+
+    ea = edge_attr.long()
+    a0 = ea[:, 0].clamp(0, d0 - 1)
+    a1 = ea[:, 1].clamp(0, d1 - 1)
+    a2 = ea[:, 2].clamp(0, d2 - 1)
+
+    # mixed radix packing (stable)
+    et = a0 + a1 * d0 + a2 * (d0 * d1)   # 0..(d0*d1*d2-1)
+    return (et + 1).long()              # 1..num_edge_types
+
+def _edge_np_to_bytes(arr: np.ndarray) -> bytes:
+    # arr: uint16 [n,n,K]
+    raw = arr.tobytes(order="C")
+    return zlib.compress(raw, level=3)
+
+def _edge_bytes_to_np(blob: bytes, dtype, shape) -> np.ndarray:
+    raw = zlib.decompress(blob)
+    return np.frombuffer(raw, dtype=dtype).reshape(shape)
+
 def get_spd_lmdb_path(prepared_path: str, spd_max_dist: int, cache_root: str = "data/prepared_spd_cache") -> str:
     os.makedirs(cache_root, exist_ok=True)
     name = os.path.splitext(os.path.basename(prepared_path))[0]  # AMES
@@ -315,23 +411,22 @@ def get_spd_lmdb_path(prepared_path: str, spd_max_dist: int, cache_root: str = "
     h = hashlib.md5(os.path.abspath(prepared_path).encode()).hexdigest()[:8]
     return os.path.join(cache_root, f"{name}_{h}_spd_md{spd_max_dist}.lmdb")
 
+
 def build_spd_lmdb_if_missing(prepared_path: str, ds: Dataset, spd_max_dist: int,
                               cache_root: str = "data/prepared_spd_cache",
                               map_size: int = 1 << 40):
-    """
-    为一个 prepared dataset 构建 SPD-LMDB：
-    key = row index (str(i))
-    value = zlib(compressed SPD bytes) + 头部记录 shape
-    为简单起见，这里把 shape 单独存到 LMDB 的 meta 里。
-    """
-    log.info("constructing spd...")
+    log.info("constructing spd + edge_input...")
     lmdb_path = get_spd_lmdb_path(prepared_path, spd_max_dist, cache_root)
     data_mdb = os.path.join(lmdb_path, "data.mdb")
+
     if os.path.exists(data_mdb):
         try:
             env_chk = lmdb.open(lmdb_path, subdir=True, readonly=True, lock=False)
             with env_chk.begin(write=False) as txn_chk:
-                ok = txn_chk.get(b"0") is not None and txn_chk.get(b"__done__") == b"1"
+                ok = (txn_chk.get(b"0") is not None and
+                      txn_chk.get(b"edge:0") is not None and
+                      txn_chk.get(b"__done__") == b"1" and
+                      txn_chk.get(b"__edge_done__") == b"1")
             env_chk.close()
             if ok:
                 return lmdb_path
@@ -342,44 +437,83 @@ def build_spd_lmdb_if_missing(prepared_path: str, ds: Dataset, spd_max_dist: int
     os.makedirs(lmdb_path, exist_ok=True)
     env = lmdb.open(lmdb_path, map_size=map_size, subdir=True, lock=True)
 
-    inf = spd_max_dist + 1
-    txn = env.begin(write=True)
-    txn.put(b"__meta_spd_max_dist__", str(spd_max_dist).encode("utf-8"))
-    for i in range(len(ds.data)):
-        if i < 10:
-            log.info("constructing spd for node 0")
+    INF = int(spd_max_dist) + 1
+    dims = get_bond_feature_dims()
+    num_edge_types = int(dims[0]) * int(dims[1]) * int(dims[2])
 
+    txn = env.begin(write=True)
+    txn.put(b"__meta_spd_max_dist__", str(int(spd_max_dist)).encode("utf-8"))
+    txn.put(b"__meta_num_edge_types__", str(int(num_edge_types)).encode("utf-8"))
+    txn.put(b"__meta_edge_max_hops__", str(int(spd_max_dist)).encode("utf-8"))  # K
+
+    for i in range(len(ds.data)):
         g = ds.data.iloc[i]["graph"]
         data = graph_dict_to_pyg_data(g)
 
-        ei = to_undirected(data.edge_index, num_nodes=data.num_nodes).cpu()
+        ei = data.edge_index
+        ea = data.edge_attr
+        if not torch.is_tensor(ei):
+            ei = torch.as_tensor(ei, dtype=torch.long)
+        if not torch.is_tensor(ea):
+            ea = torch.as_tensor(ea, dtype=torch.long)
+        ei = ei.long().cpu()
+        ea = ea.long().cpu()
 
-        spd = shortest_path_dense_unweighted(data.num_nodes, ei, inf=inf)
-        spd = np.minimum(spd, inf).astype(np.uint16)
+        n = int(data.num_nodes)
 
-        blob = _spd_np_to_bytes(spd)
+        # edge type ids (1..T)
+        edge_type_id = pack_edge_type_id(ea)
 
-        txn.put(f"__shape__:{i}".encode("utf-8"), f"{spd.shape[0]}".encode("utf-8"))
-        txn.put(str(i).encode("utf-8"), blob)
-        
+        # map (u,v)->type, both directions
+        edge_type_map = {}
+        for k in range(ei.size(1)):
+            u = int(ei[0, k])
+            v = int(ei[1, k])
+            et = int(edge_type_id[k])
+            edge_type_map.setdefault((u, v), et)
+            edge_type_map.setdefault((v, u), et)
+
+        ei_u = to_undirected(ei, num_nodes=n).cpu()
+
+        spd, edge_input = shortest_path_spd_and_edge_input(
+            num_nodes=n,
+            edge_index_undirected=ei_u,
+            edge_type_map=edge_type_map,
+            spd_max_dist=int(spd_max_dist),
+        )
+        spd = np.minimum(spd, INF).astype(np.uint16)  # [n,n]
+        # edge_input: [n,n,K] uint16, 0 padding
+
+        # ---- sanity check: edge ids must fit vocab
+        if edge_input.max() > num_edge_types:
+            raise ValueError(f"edge_input id overflow at row {i}: max_id={edge_input.max()} > num_edge_types={num_edge_types}")
+
+        spd_blob = _spd_np_to_bytes(spd)
+        edge_blob = _edge_np_to_bytes(edge_input)
+
+        txn.put(f"__shape__:{i}".encode("utf-8"), f"{n}".encode("utf-8"))
+        txn.put(str(i).encode("utf-8"), spd_blob)
+        txn.put(f"edge:{i}".encode("utf-8"), edge_blob)
+
         if (i + 1) % 1000 == 0:
             txn.commit()
             txn = env.begin(write=True)
 
         if (i + 1) % 5000 == 0:
-            print(f"[SPD-LMDB] built {i+1}/{len(ds.data)}")
-    
-    txn.put(b"__done__", b"1")
-    txn.commit()
+            print(f"[SPD+EDGE-LMDB] built {i+1}/{len(ds.data)}")
 
+    txn.put(b"__done__", b"1")
+    txn.put(b"__edge_done__", b"1")
+    txn.commit()
     env.sync()
     env.close()
     return lmdb_path
 
 class CollateWithSPDLmdbDownstream:
     """
-    collate_fn：把 list[Data] -> Batch，并附加 batch.spatial_pos_dense = [B,L,L]
-    SPD 从 LMDB 读取（key=样本在 ds.data 里的行号 i）
+    collate_fn附加
+      batch.spatial_pos_dense: [B,L,L]
+      batch.edge_input_dense:  [B,L,L,K]  K=spd_max_dist
     """
     def __init__(self, spd_lmdb_path: str, spd_max_dist: int):
         self.spd_lmdb_path = spd_lmdb_path
@@ -399,15 +533,16 @@ class CollateWithSPDLmdbDownstream:
         return self._env
 
     def __call__(self, batch_list: List[Data]):
-        # 这里要求每个 Data 里有一个字段 data._row_id（对应 ds.data 的 i）
         env = self._get_env()
         inf = self.spd_max_dist + 1
+        K = self.spd_max_dist
 
         n_list = [int(d.num_nodes) for d in batch_list]
         L = max(n_list)
         B = len(batch_list)
 
         spd_dense = torch.full((B, L, L), fill_value=inf, dtype=torch.long)
+        edge_dense = torch.zeros((B, L, L, K), dtype=torch.long)  # 0 padding
 
         with env.begin(write=False) as txn:
             for bi, d in enumerate(batch_list):
@@ -420,18 +555,25 @@ class CollateWithSPDLmdbDownstream:
 
                 n_str = txn.get(f"__shape__:{i}".encode("utf-8"))
                 if n_str is None:
-                    raise KeyError(f"SPD shape missing for row {i}")
+                    raise KeyError(f"shape missing for row {i}")
                 n2 = int(n_str.decode("utf-8"))
                 if n2 != n:
-                    # 数据发生变化（prepared 文件被重写）会出现这种情况
-                    raise ValueError(f"SPD shape mismatch row {i}: lmdb_n={n2}, data_n={n}")
+                    raise ValueError(f"shape mismatch row {i}: lmdb_n={n2}, data_n={n}")
 
                 spd = _spd_bytes_to_np(blob, dtype=np.uint16, shape=(n, n))
                 spd = np.minimum(spd, inf)
-                spd_dense[bi, :n, :n] = torch.from_numpy(spd).long()
+                spd_dense[bi, :n, :n] = torch.from_numpy(spd.astype(np.int64))
+
+                eblob = txn.get(f"edge:{i}".encode("utf-8"))
+                if eblob is None:
+                    raise KeyError(f"EDGE_INPUT not found in LMDB for row {i} (key=edge:{i})")
+
+                edge_in = _edge_bytes_to_np(eblob, dtype=np.uint16, shape=(n, n, K))
+                edge_dense[bi, :n, :n, :] = torch.from_numpy(edge_in.astype(np.int64))
 
         batch = Batch.from_data_list(batch_list)
         batch.spatial_pos_dense = spd_dense
+        batch.edge_input_dense = edge_dense
         return batch
 
 def infer_in_dims_from_dataset(ds: Dataset) -> Tuple[int, int]:
@@ -1040,49 +1182,20 @@ def fit_and_eval_embedding(dataset: EmbeddedDataset,
 #  Main procedure (prepared -> embed cache -> score heads)
 # ============================================================
 
-def build_encoder(cfg,device, node_in_dim, edge_in_dim):
-    if cfg.name == 'normal':
-        encoder = GraphGPSEncoder(
-            cfg,
-            node_in_dim=node_in_dim,
-            edge_in_dim=edge_in_dim
-        ).to(device)
-    elif cfg.name == 'cls':
-        encoder = GraphGPSEncoder_CLS(
-            cfg,
-            node_in_dim=node_in_dim,
-            edge_in_dim=edge_in_dim
-        ).to(device)
-    elif cfg.name == 'cls_graphormer':
-        encoder = GraphGPSEncoder_CLS_GraphormerSPD(
-            cfg,
-            node_in_dim=node_in_dim,
-            edge_in_dim=edge_in_dim
-        ).to(device)
-    elif cfg.name == 'cls_gps':
-        encoder = GraphGPSEncoder_CLS_GPSSPD(
-            cfg,
-            node_in_dim=node_in_dim,
-            edge_in_dim=edge_in_dim
-        ).to(device)
-    else:
-        raise ValueError("encoder name error!")
-    return encoder
-
 def run_downstream_from_prepared(
     prepared_path: str,
     prepared_spd_path: str,
     ckpt_path: str,
-    encoder_cfg: Any,
+    cfg: Any,
     device: torch.device,
     out_dir: str,
     model_name: str,
     illegal_smiles_txt: Optional[str] = None,
-    override: bool = False,
     embed_batch_size: int = 256,
     num_workers: int = 8,
 ):
     os.makedirs(out_dir, exist_ok=True)
+    encoder_cfg = cfg.encoder
 
     # 1) load prepared dataset
     ds = load_prepared_dataset(prepared_path, illegal_smiles_txt=illegal_smiles_txt)
@@ -1092,47 +1205,37 @@ def run_downstream_from_prepared(
     node_in_dim, edge_in_dim = infer_in_dims_from_dataset(ds)
     log.info(f"Inferred dims: node_in_dim={node_in_dim}, edge_in_dim={edge_in_dim}")
 
-    # encoder = GraphGPSEncoder(encoder_cfg, node_in_dim=node_in_dim, edge_in_dim=edge_in_dim).to(device)
-    encoder = build_encoder(encoder_cfg, device, node_in_dim, edge_in_dim)
+    encoder = build_encoder(cfg, device, node_in_dim, edge_in_dim)
     ckpt = torch.load(ckpt_path, map_location="cpu",weights_only=True)
     encoder.load_state_dict(ckpt["encoder"], strict=True)
     encoder.eval()
     log.info(f"Load encoder finished")
 
-
     # 3) embedding cache path (benchmark style)
     save_dir = os.path.join(out_dir, dataset_name)
     os.makedirs(save_dir, exist_ok=True)
-    embedded_path = os.path.join(save_dir, f"{model_name}.joblib")
 
-    if (not override) and os.path.exists(embedded_path):
-        embedded: EmbeddedDataset = joblib.load(embedded_path)
-        log.info(f"Loaded cached embeddings: {embedded_path}")
-    else:
-        log.info(f"create emb...")
-        X = embed_dataset_graph_level(
-            encoder=encoder,
-            ds=ds,
-            device=device,
-            prepared_path=prepared_path,
-            batch_size=embed_batch_size,
-            num_workers=num_workers,
-            spd_max_dist=int(encoder_cfg.spd_max_dist),
-            spd_cache_root=prepared_spd_path,
-        )
+    log.info(f"create emb...")
+    X = embed_dataset_graph_level(
+        encoder=encoder,
+        ds=ds,
+        device=device,
+        prepared_path=prepared_path,
+        batch_size=embed_batch_size,
+        num_workers=num_workers,
+        spd_max_dist=int(encoder_cfg.spd_max_dist),
+        spd_cache_root=prepared_spd_path,
+    )
 
-        y = ds.labels.to_numpy(dtype=float)
-
-        embedded = EmbeddedDataset(
-            name=dataset_name,
-            task=ds.task,
-            embedder=model_name,
-            X=X,
-            y_np=y,
-            splits=ds.splits,
-        )
-        joblib.dump(embedded, embedded_path)
-        log.info(f"Saved embeddings: {embedded_path}")
+    y = ds.labels.to_numpy(dtype=float)
+    embedded = EmbeddedDataset(
+        name=dataset_name,
+        task=ds.task,
+        embedder=model_name,
+        X=X,
+        y_np=y,
+        splits=ds.splits,
+    )
 
     # 4) train downstream heads
     results = []
@@ -1178,24 +1281,20 @@ def main():
                         help="Path to prepared dataset (.json or .joblib), e.g. prepared/DILI.json")
     parser.add_argument("--prepared_spd_path", type=str, default="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared_spd_cache",
                         help="Path to prepared dataset (.json or .joblib), e.g. prepared/DILI.json")
-    parser.add_argument("--ckpt_date", type=str, required=False, default="20260127-143109",
+    parser.add_argument("--ckpt_date", type=str, default="20260204-163653",
                         help="Path to your training checkpoint best.pt")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--out_dir", type=str, default="./logs_embedding/embedded_cache",
                         help="Where to store embeddings/preds/results (benchmark-like)")
-    parser.add_argument("--model_name", type=str, default="GraphGPS_Encoder",
-                        help="Embedder name used in result table")
     parser.add_argument("--illegal_smiles", type=str, default='./configs/illegal_smiles.txt',
                         help="Path to illegal_smiles.txt (optional)")
-    parser.add_argument("--override", action="store_true",
-                        help="Recompute embeddings even if cached exists")
     parser.add_argument("--enlayer",default=9)
     parser.add_argument("--delayer",default=5)
     parser.add_argument("--encoder_name", default="cls_graphormer")
     parser.add_argument("--denoiser_name", default="uni_o2_condition")
-
     parser.add_argument("--embed_bs", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--model_name",type=str, default=None)
 
     # encoder config: easiest is to load the SAME training yaml and pass cfg.encoder
     parser.add_argument("--train_config", type=str, required=False,default="configs/training.yml",
@@ -1216,21 +1315,22 @@ def main():
     cfg.encoder.name = args.encoder_name
     cfg.model.model_type = args.denoiser_name
 
-    encoder_cfg = cfg.encoder
-
     ckpt_file_name = f"en{args.enlayer}_de{args.delayer}_e_{args.encoder_name}_d_{args.denoiser_name}_{args.ckpt_date}"
     ckpt_path = os.path.join("./outputs/checkpoints/training", ckpt_file_name, "best.pt")
-
+    if args.model_name is None:
+        model_name = f"en{args.enlayer}_de{args.delayer}_e_{args.encoder_name}_d_{args.denoiser_name}"
+    else:
+        model_name = args.model_name
+        
     run_downstream_from_prepared(
         prepared_path=args.prepared_path,
         prepared_spd_path=args.prepared_spd_path,
         ckpt_path=ckpt_path,
-        encoder_cfg=encoder_cfg,
+        cfg=cfg,
         device=device,
         out_dir=args.out_dir,
-        model_name=args.model_name,
+        model_name=model_name,
         illegal_smiles_txt=args.illegal_smiles,
-        override=args.override,
         embed_batch_size=args.embed_bs,
         num_workers=args.num_workers,
     )

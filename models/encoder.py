@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
 
-from torch_geometric.nn import GINEConv, global_mean_pool
+from torch_geometric.nn import GINEConv, global_mean_pool, GINConv
 from torch_geometric.utils import degree
 from torch_geometric.utils import to_dense_batch
 from ogb.graphproppred.mol_encoder import AtomEncoder, BondEncoder
@@ -765,8 +765,6 @@ class GraphGPSBlock_CLS_GraphormerSPD(nn.Module):
 
         return h_out, cls_out
 
-
-
 class GraphGPSEncoder_CLS_GraphormerSPD(nn.Module):
     """
     GraphGPS + CLS，但 global attention 使用 Graphormer-style SPD bias；
@@ -890,151 +888,113 @@ class GraphGPSEncoder_CLS_GraphormerSPD(nn.Module):
 
         return h, graph_emb
 
+
 ####################################
-# GraphGPS_CLS, with CLS, GraphGPS's style PE
+# GraphGPS_CLS, with CLS, add Pearl PE
 ####################################
-class GraphGlobalSelfAttention_CLS_NoBias(nn.Module):
+
+class PearlAbsolutePE(nn.Module):
+    """
+    R-PEARL (stronger): Random identifiers -> structure-only ResGIN Φ -> mean over M samples.
+
+    - 结构-only：只用 edge_index，不看节点/边属性
+    - M 个随机标识样本并行展开 (M copies)
+    - Φ 使用 GINConv(MLP) + residual + pre-LN
+    """
     def __init__(
         self,
         hidden_dim: int,
-        num_heads: int,
-        attn_dropout: float = 0.0,
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-
-        self.mha = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=attn_dropout,
-            batch_first=True,
-        )
-
-    def forward(
-        self,
-        h: torch.Tensor,     # [N, D]
-        batch: torch.Tensor, # [N]
-        cls: torch.Tensor,   # [B, D]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        return:
-          out_cat: [B, L+1, D]  (CLS + nodes)
-          mask:    [B, L]       node mask
-        """
-        h_dense, mask = to_dense_batch(h, batch=batch)  # [B,L,D], [B,L]
-        B, L, D = h_dense.shape
-        if cls.size(0) != B or cls.size(1) != D:
-            raise ValueError(f"cls shape mismatch: got {cls.shape}, expected [{B},{D}]")
-
-        cls_tok = cls.unsqueeze(1)                   # [B,1,D]
-        h_cat = torch.cat([cls_tok, h_dense], dim=1) # [B,L+1,D]
-
-        cls_mask = h_dense.new_ones(B, 1, dtype=torch.bool)   # [B,1]
-        mask_cat = torch.cat([cls_mask, mask], dim=1)         # [B,L+1]
-        key_padding_mask = ~mask_cat                          # True=pad
-
-        out_cat, _ = self.mha(
-            h_cat, h_cat, h_cat,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-        return out_cat, mask
-
-class GraphGPSBlock_CLS_GPSStyle(nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int,
-        edge_dim: int,
+        q_dim: int = 16,
+        num_samples: int = 8,          # M
+        num_layers: int = 4,           # 建议比原来 2 稍深一点
+        mlp_hidden_mult: int = 2,      # GIN 内部 MLP 宽度倍率
         dropout: float = 0.1,
-        attn_dropout: float = 0.0,
+        deterministic_eval: bool = True,
     ):
         super().__init__()
-        self.dropout = dropout
+        self.hidden_dim = int(hidden_dim)
+        self.q_dim = int(q_dim)
+        self.num_samples = int(num_samples)
+        self.num_layers = int(num_layers)
+        self.mlp_hidden_mult = int(mlp_hidden_mult)
+        self.dropout = float(dropout)
+        self.deterministic_eval = bool(deterministic_eval)
 
-        nn_local = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.local_conv = GINEConv(nn_local, edge_dim=edge_dim)
+        self.in_proj = nn.Linear(self.q_dim, self.hidden_dim)
 
-        self.global_attn = GraphGlobalSelfAttention_CLS_NoBias(
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            attn_dropout=attn_dropout,
-        )
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
 
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        for _ in range(self.num_layers):
+            mlp = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.mlp_hidden_mult * self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.mlp_hidden_mult * self.hidden_dim, self.hidden_dim),
+            )
+            # train_eps=True => eps 可学习（更强）
+            self.convs.append(GINConv(nn=mlp, train_eps=True))
+            self.norms.append(nn.LayerNorm(self.hidden_dim))
 
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, 4 * hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * hidden_dim, hidden_dim),
-        )
+        self.out_norm = nn.LayerNorm(self.hidden_dim)
 
-    def forward(
-        self,
-        h: torch.Tensor,          # [N,D]
-        edge_index: torch.Tensor, # [2,E]
-        edge_attr: torch.Tensor,  # [E,edge_dim]
-        batch: torch.Tensor,      # [N]
-        cls: torch.Tensor,        # [B,D]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _sample_q(self, N: int, device, dtype):
+        if (not self.training) and self.deterministic_eval:
+            # 局部固定 seed，不污染外部 RNG
+            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+                torch.manual_seed(0)
+                q = torch.randn(self.num_samples, N, self.q_dim, device=device, dtype=dtype)
+        else:
+            q = torch.randn(self.num_samples, N, self.q_dim, device=device, dtype=dtype)
+        return q
 
-        # local
-        h_local = self.local_conv(h, edge_index, edge_attr)
-        h_local = F.dropout(h_local, p=self.dropout, training=self.training)
+    def forward(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        """
+        edge_index: [2, E]，整个 batch 的稀疏边（各图互不连通）
+        num_nodes: N
+        return:
+          pe: [N, hidden_dim]
+        """
+        N = int(num_nodes)
+        device = edge_index.device
+        dtype = torch.float32
 
-        # dense alignment for "cat-level" residual
-        h_dense, mask = to_dense_batch(h, batch=batch)           # [B,L,D]
-        h_local_dense, _ = to_dense_batch(h_local, batch=batch)  # [B,L,D]
-        B, L, D = h_dense.shape
+        # 1) 随机节点标识 q: [M,N,q_dim]
+        q = self._sample_q(N, device=device, dtype=dtype)
 
-        if cls.size(0) != B or cls.size(1) != D:
-            raise ValueError(f"cls shape mismatch: got {cls.shape}, expected [{B},{D}]")    
-        cls_tok = cls.unsqueeze(1)                                # [B,1,D]
-        cat_in = torch.cat([cls_tok, h_dense], dim=1)             # [B,L+1,D]
-        zeros_cls = h_dense.new_zeros(B, 1, D)
-        local_cat = torch.cat([zeros_cls, h_local_dense], dim=1)  # [B,L+1,D]
+        # 2) 向量化展开：把 M 个样本当作 M 个“独立图副本”
+        M = self.num_samples
+        q_flat = q.reshape(M * N, self.q_dim)
+        x = self.in_proj(q_flat)  # [M*N, H]
 
-        # global
-        attn_out_cat, _ = self.global_attn(h=h, batch=batch, cls=cls)
-        attn_out_cat = F.dropout(attn_out_cat, p=self.dropout, training=self.training)
+        # 复制 edge_index 并按样本偏移节点编号
+        E = edge_index.size(1)
+        offsets = (torch.arange(M, device=device, dtype=edge_index.dtype) * N).view(1, M, 1)  # [1,M,1]
+        edge_rep = edge_index.view(2, 1, E).repeat(1, M, 1) + offsets                         # [2,M,E]
+        edge_rep = edge_rep.reshape(2, M * E)                                                 # [2,M*E]
 
-        # residual + norm
-        cat = self.norm1(cat_in + local_cat + attn_out_cat)
+        # 3) 结构 MPNN Φ：ResGIN + pre-LN
+        for conv, ln in zip(self.convs, self.norms):
+            h_in = x
+            x = ln(x)
+            x = conv(x, edge_rep)                 # GINConv 内部会 sum 聚合 + MLP
+            x = F.gelu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = x + h_in                          # residual
 
-        # ffn
-        cat_ffn = self.ffn(cat)
-        cat_ffn = F.dropout(cat_ffn, p=self.dropout, training=self.training)
-        cat = self.norm2(cat + cat_ffn)
+        x = self.out_norm(x)                      # [M*N, H]
+        x = x.view(M, N, self.hidden_dim)         # [M,N,H]
 
-        # split back
-        cls_out = cat[:, 0, :]          # [B,D]
-        node_out_dense = cat[:, 1:, :]  # [B,L,D]
-        h_out = node_out_dense[mask]    # [N,D]
-        return h_out, cls_out
+        # 4) 聚合（ρ）：mean over samples -> [N,H]
+        pe = x.mean(dim=0)
+        return pe
 
-class GraphGPSEncoder_CLS_GPSSPD(nn.Module):
-    """
-    Strict GraphGPS-style:
-      - SPD is used to create node-wise structural encoding (SE)
-      - SE is fused into node features BEFORE blocks
-      - global attention DOES NOT consume SPD bias
-      - CLS token kept (graph token)
-    """
+class GraphGPSEncoder_CLS_PEARL(nn.Module):
     def __init__(self, cfg, node_in_dim: int, edge_in_dim: int):
         super().__init__()
         self.cfg = cfg
-        self.hidden_dim = cfg.hidden_dim
 
-        # ====== your existing encoders ======
-        self.atom_encoder = AtomEncoder(cfg.hidden_dim)
-        self.bond_encoder = BondEncoder(cfg.hidden_dim)
+        self.atom_encoder = AtomEncoder(cfg.hidden_dim)      # -> [N, hidden_dim]
+        self.bond_encoder = BondEncoder(cfg.hidden_dim)      # -> [E, hidden_dim]
 
         if cfg.edge_emb_dim == cfg.hidden_dim:
             self.edge_proj = nn.Identity()
@@ -1043,14 +1003,35 @@ class GraphGPSEncoder_CLS_GPSSPD(nn.Module):
 
         self.degree_enc = DegreeEncoder(cfg.max_degree, cfg.hidden_dim) if cfg.use_degree else None
 
-        # ====== GraphGPS blocks (NO SPD BIAS) ======
+        # pearl part
+        self.pearl_pe = PearlAbsolutePE(
+                hidden_dim=cfg.hidden_dim,
+                q_dim=int(getattr(cfg, "pearl_q_dim", 16)),
+                num_samples=int(getattr(cfg, "pearl_num_samples", 8)),
+                num_layers=int(getattr(cfg, "pearl_num_layers", 2)),
+                dropout=float(getattr(cfg, "pearl_dropout", 0.0)),
+                deterministic_eval=bool(getattr(cfg, "pearl_deterministic_eval", True)),
+            )
+        self.pearl_scale = nn.Parameter(torch.tensor(0.1))
+
+        self.pearl_fuse = str(getattr(cfg, "pearl_fuse", "add")).lower()
+        if self.pearl_fuse not in ("add", "concat"):
+            raise ValueError(f"cfg.pearl_fuse must be 'add' or 'concat', got {self.pearl_fuse}")
+
+        if self.pearl_fuse == "concat":
+            self.pearl_fuse_proj = nn.Linear(2 * cfg.hidden_dim, cfg.hidden_dim)
+        else:
+            self.pearl_fuse_proj = None
+
+        # blocks part
         self.blocks = nn.ModuleList([
-            GraphGPSBlock_CLS_GPSStyle(
+            GraphGPSBlock_CLS(
                 hidden_dim=cfg.hidden_dim,
                 num_heads=cfg.num_heads,
                 edge_dim=cfg.edge_emb_dim,
                 dropout=cfg.dropout,
                 attn_dropout=cfg.attn_dropout,
+                use_spd_bias=False,
             )
             for _ in range(cfg.num_layers)
         ])
@@ -1058,80 +1039,19 @@ class GraphGPSEncoder_CLS_GPSSPD(nn.Module):
         self.out_norm = nn.LayerNorm(cfg.hidden_dim)
         self.graph_norm = nn.LayerNorm(cfg.hidden_dim)
 
-        # CLS graph token
+        # cls token
         self.graph_token = nn.Parameter(torch.zeros(1, cfg.hidden_dim))
         nn.init.xavier_uniform_(self.graph_token)
 
         self._expect_node_dim = node_in_dim
         self._expect_edge_dim = edge_in_dim
 
-        # ====== SPD node structural encoding ======
-        # use cfg.use_spd_node_pe as switch; if you don't have it, reuse cfg.use_spd_bias but semantics change
-        self.use_spd_node_pe = bool(getattr(cfg, "use_spd_node_pe", True))
-        self.spd_max_dist = int(getattr(cfg, "spd_max_dist", 8))
-        self.spd_inf = self.spd_max_dist + 1
-        spd_bins = self.spd_max_dist + 2  # 0..max+1
-
-        # mode: "sum" (strict, simple) or "concat" (often stronger but slightly deviates from minimalism)
-        self.spd_fuse_mode = str(getattr(cfg, "spd_fuse_mode", "concat"))  # "sum" or "concat"
-
-        self.spd_hist_mlp = nn.Sequential(
-            nn.Linear(spd_bins, cfg.hidden_dim),
-            nn.GELU(),
-            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
-        )
-
-        if self.spd_fuse_mode == "concat":
-            self.spd_cat_proj = nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim)
-        else:
-            self.spd_cat_proj = None
-
-    def _inject_spd_node_se(self, h: torch.Tensor, batch_id: torch.Tensor, spatial_pos_dense: torch.Tensor) -> torch.Tensor:
-        """
-        spatial_pos_dense: [B,L,L] (padded with any value, which will be masked, but value range in [0,spd_inf])
-        Return: updated h [N,H] with SE fused.
-        """
-        device = h.device
-        spd = spatial_pos_dense.to(device=device, dtype=torch.long)  # [B,L,L]
-        h_dense, mask = to_dense_batch(h, batch=batch_id)            # [B,L,H], [B,L]
-        B, L, H = h_dense.shape
-
-        if spd.shape[0] != B:
-            raise ValueError(f"spatial_pos_dense batch mismatch: spd.B={spd.shape[0]}, expected B={B}")
-        if spd.shape[1] < L or spd.shape[2] < L:
-            raise ValueError(f"spatial_pos_dense too small: got {spd.shape}, need at least [{B},{L},{L}]")
-
-        # crop to current max L (safe)
-        spd = spd[:, :L, :L].clamp(0, self.spd_inf)  # [B,L,L]
-
-        # ---- IMPORTANT: avoid padding pollution ----
-        # mask_j indicates which columns (j) are real nodes
-        # mask: [B,L] -> mask_j: [B,1,L,1] broadcast to [B,L,L,C]
-        mask_j = mask.unsqueeze(1).unsqueeze(-1)  # [B,1,L,1]
-
-        C = self.spd_max_dist + 2  # bins
-        oh = F.one_hot(spd, num_classes=C).float()  # [B,L,L,C]
-        oh = oh * mask_j  # ignore padded j columns
-
-        hist = oh.sum(dim=2)  # [B,L,C] (for each i, count over valid j)
-
-        # normalize by number of valid nodes in the graph (n)
-        n_nodes = mask.sum(dim=1, keepdim=True).clamp(min=1).unsqueeze(-1)  # [B,1,1]
-        hist = hist / n_nodes
-
-        pe_dense = self.spd_hist_mlp(hist)  # [B,L,H]
-
-        if self.spd_fuse_mode == "sum":
-            h_dense = h_dense + pe_dense
-        elif self.spd_fuse_mode == "concat":
-            h_dense = self.spd_cat_proj(torch.cat([h_dense, pe_dense], dim=-1))
-        else:
-            raise ValueError(f"Unknown spd_fuse_mode={self.spd_fuse_mode}")
-
-        h_out = h_dense[mask]  # [N,H]
-        return h_out
-
     def forward(self, batch):
+        """
+        return:
+          node_emb:  [N, hidden_dim]
+          graph_emb: [B, hidden_dim]  （图级 CLS 表征）
+        """
         x = batch.x
         edge_index = batch.edge_index
         edge_attr = batch.edge_attr
@@ -1148,35 +1068,192 @@ class GraphGPSEncoder_CLS_GPSSPD(nn.Module):
         if edge_attr.size(-1) != self._expect_edge_dim:
             raise ValueError(f"Unexpected edge feature dim: got {edge_attr.size(-1)}, expect {self._expect_edge_dim}")
 
-        # node/edge encoding
-        h = self.atom_encoder(x)                           # [N,H]
-        e = self.edge_proj(self.bond_encoder(edge_attr))   # [E,edge_emb_dim]
+        # node / edge encoding
+        h = self.atom_encoder(x)                           # [N, H]
+        e = self.edge_proj(self.bond_encoder(edge_attr))   # [E, edge_emb_dim]
 
-        # degree
+        # degree encoding on nodes
         if self.degree_enc is not None:
             h = h + self.degree_enc(edge_index, num_nodes=N)
 
-        # ---- GraphGPS-style: SPD -> node SE injected into h ----
-        if self.use_spd_node_pe:
-            spatial_pos_dense = getattr(batch, "spatial_pos_dense", None)
-            if spatial_pos_dense is None:
-                raise ValueError("use_spd_node_pe=True but batch.spatial_pos_dense is missing. Did you set collate_fn?")
-            h = self._inject_spd_node_se(h, batch_id, spatial_pos_dense)
+        pe = self.pearl_pe(edge_index=edge_index, num_nodes=N)  # [N,H]
+        pe = pe.to(dtype=h.dtype, device=h.device)
+        if self.pearl_fuse == "add":
+            h = h + pe * self.pearl_scale
+        else:  # concat
+            h = self.pearl_fuse_proj(torch.cat([h, pe], dim=-1))
 
         # init CLS per graph
         B = int(batch_id.max().item()) + 1
-        cls = self.graph_token.expand(B, -1).contiguous()  # [B,H]
+        cls = self.graph_token.expand(B, -1).contiguous()  # [B, H]
 
-        # blocks
+        # stacked blocks
         for blk in self.blocks:
             h, cls = blk(
                 h=h,
                 edge_index=edge_index,
                 edge_attr=e,
                 batch=batch_id,
+                spatial_pos=None,
+                cls=cls,
+            )
+
+        h = self.out_norm(h)
+        # graph_emb = self.graph_norm(cls)
+        graph_emb = self.graph_norm(cls)
+
+        return h, graph_emb
+
+####################################
+# GraphGPS_CLS, with CLS, add both spd and Pearl PE
+####################################
+class GraphGPSEncoder_CLS_GraphormerSPD_Pearl(nn.Module):
+    def __init__(self, cfg, node_in_dim: int, edge_in_dim: int):
+        super().__init__()
+        self.cfg = cfg
+
+        self.atom_encoder = AtomEncoder(cfg.hidden_dim)      # [N,H]
+        self.bond_encoder = BondEncoder(cfg.hidden_dim)      # [E,H]
+
+        if cfg.edge_emb_dim == cfg.hidden_dim:
+            self.edge_proj = nn.Identity()
+        else:
+            self.edge_proj = nn.Linear(cfg.hidden_dim, cfg.edge_emb_dim)
+
+        self.degree_enc = DegreeEncoder(cfg.max_degree, cfg.hidden_dim) if cfg.use_degree else None
+
+        if hasattr(cfg, "num_edge_types") and int(cfg.num_edge_types) > 0:
+            num_edge_types = int(cfg.num_edge_types)
+        else:
+            from ogb.utils.features import get_bond_feature_dims
+            dims = get_bond_feature_dims()  # len=3
+            num_edge_types = int(dims[0]) * int(dims[1]) * int(dims[2])
+        self.num_edge_types = num_edge_types
+
+
+        # pearl part
+        self.pearl_pe = PearlAbsolutePE(
+                hidden_dim=cfg.hidden_dim,
+                q_dim=int(getattr(cfg, "pearl_q_dim", 16)),
+                num_samples=int(getattr(cfg, "pearl_num_samples", 8)),
+                num_layers=int(getattr(cfg, "pearl_num_layers", 2)),
+                dropout=float(getattr(cfg, "pearl_dropout", 0.0)),
+                deterministic_eval=bool(getattr(cfg, "pearl_deterministic_eval", True)),
+            )
+        self.pearl_scale = nn.Parameter(torch.tensor(0.1))
+
+        self.pearl_fuse = str(getattr(cfg, "pearl_fuse", "add")).lower()
+        if self.pearl_fuse not in ("add", "concat"):
+            raise ValueError(f"cfg.pearl_fuse must be 'add' or 'concat', got {self.pearl_fuse}")
+
+        if self.pearl_fuse == "concat":
+            self.pearl_fuse_proj = nn.Linear(2 * cfg.hidden_dim, cfg.hidden_dim)
+        else:
+            self.pearl_fuse_proj = None
+
+        # block part
+        self.blocks = nn.ModuleList([
+            GraphGPSBlock_CLS_GraphormerSPD(
+                hidden_dim=cfg.hidden_dim,
+                num_heads=cfg.num_heads,
+                edge_dim=cfg.edge_emb_dim,
+                dropout=cfg.dropout,
+                attn_dropout=cfg.attn_dropout,
+                spd_max_dist=cfg.spd_max_dist,
+                num_edge_types=num_edge_types,
+            )
+            for _ in range(cfg.num_layers)
+        ])
+
+        self.out_norm   = nn.LayerNorm(cfg.hidden_dim)
+        self.graph_norm = nn.LayerNorm(cfg.hidden_dim)
+
+        # graph-level CLS token（共享）
+        self.graph_token = nn.Parameter(torch.zeros(1, cfg.hidden_dim))
+        nn.init.xavier_uniform_(self.graph_token)
+
+        self._expect_node_dim = node_in_dim
+        self._expect_edge_dim = edge_in_dim
+
+        self.spd_max_dist = cfg.spd_max_dist
+
+    # ---------- forward ----------
+    def forward(self, batch):
+        """
+        return:
+          node_emb:  [N, hidden_dim]
+          graph_emb: [B, hidden_dim]
+        """
+        x = batch.x
+        edge_index = batch.edge_index
+        edge_attr = batch.edge_attr
+        batch_id = batch.batch
+        N = x.size(0)
+
+        if x.dtype != torch.long:
+            x = x.long()
+        if edge_attr.dtype != torch.long:
+            edge_attr = edge_attr.long()
+
+        if x.size(-1) != self._expect_node_dim:
+            raise ValueError(f"Unexpected node feature dim: got {x.size(-1)}, expect {self._expect_node_dim}")
+        if edge_attr.size(-1) != self._expect_edge_dim:
+            raise ValueError(f"Unexpected edge feature dim: got {edge_attr.size(-1)}, expect {self._expect_edge_dim}")
+
+        # node / edge encoding
+        h = self.atom_encoder(x)                           # [N,H]
+        e = self.edge_proj(self.bond_encoder(edge_attr))   # [E,edge_emb_dim]
+
+        # degree encoding
+        if self.degree_enc is not None:
+            h = h + self.degree_enc(edge_index, num_nodes=N)
+        pe = self.pearl_pe(edge_index=edge_index, num_nodes=N)  # [N,H]
+        pe = pe.to(dtype=h.dtype, device=h.device)
+        if self.pearl_fuse == "add":
+            h = h + pe * self.pearl_scale
+        else:  # concat
+            h = self.pearl_fuse_proj(torch.cat([h, pe], dim=-1))
+
+        if not hasattr(batch, "spatial_pos_dense"):
+            raise ValueError("use_spd_bias=True but batch has no spatial_pos_dense. Did you set collate_fn?")
+        spatial_pos_dense = batch.spatial_pos_dense
+        if spatial_pos_dense is None:
+            raise ValueError("use_spd_bias=True but batch.spatial_pos_dense is None.")
+        if spatial_pos_dense.dtype != torch.long:
+            spatial_pos_dense = spatial_pos_dense.long()
+
+        # edge_input from collate
+        if not hasattr(batch, "edge_input_dense"):
+            raise ValueError("use_spd_bias=True but batch has no edge_input_dense. Did you build SPD+EDGE cache and collate it?")
+        edge_input_dense = batch.edge_input_dense
+        if edge_input_dense is None:
+            raise ValueError("batch.edge_input_dense is None.")
+        if edge_input_dense.dtype != torch.long:
+            edge_input_dense = edge_input_dense.long()
+        # edge_input_dense: [B,L,L,K]
+        max_id = int(edge_input_dense.max().item())
+        if max_id > self.num_edge_types:
+            raise ValueError(f"edge_input_dense has id {max_id} > num_edge_types {self.num_edge_types}. Packing/dims mismatch.")
+
+
+
+        # init CLS for each graph
+        B = int(batch_id.max().item()) + 1
+        cls = self.graph_token.expand(B, -1).contiguous()  # [B,H]
+
+        # stacked blocks
+        for blk in self.blocks:
+            h, cls = blk(
+                h=h,
+                edge_index=edge_index,
+                edge_attr=e,
+                batch=batch_id,
+                spatial_pos=spatial_pos_dense,
+                edge_input=edge_input_dense,
                 cls=cls,
             )
 
         h = self.out_norm(h)
         graph_emb = self.graph_norm(cls)
+
         return h, graph_emb

@@ -7,7 +7,7 @@ data:
   edge_in_dim: 3
   
 encoder:
-  name: cls_graphormer # ['normal', 'cls', 'cls_graphormer', 'cls_gps']
+  name: cls_graphormer_pearl # ['normal', 'cls', 'cls_graphormer', 'cls_pearl' 'cls_graphormer_pearl']
   hidden_dim: 176
   num_layers: 9
   num_heads: 8
@@ -18,8 +18,13 @@ encoder:
   max_degree: 10
   use_spd_bias: True
   spd_max_dist: 8
-  spd_fuse_mode: concat # only used in cls_gps
-  use_spd_node_pe: True # use_spd_node_pe
+
+  pearl_q_dim: 16
+  pearl_num_samples: 8
+  pearl_num_layers: 4
+  pearl_dropout: 0.1
+  pearl_deterministic_eval: True
+  pearl_fuse: "concat"      # add or concat
 
 model:
   model_mean_type: C0  # ['noise', 'C0']
@@ -35,9 +40,9 @@ model:
   center_pos_mode: graph
 
   node_indicator: True
-  model_type: uni_o2_cat # uni_o2/uni_o2_condition/uni_o2_cat
+  model_type: uni_o2_condition # uni_o2/uni_o2_condition/uni_o2_cat
   num_blocks: 1
-  num_layers: 4
+  num_layers: 5
   hidden_dim: 128
   n_heads: 16
   edge_feat_dim: 5  # edge type feat

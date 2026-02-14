@@ -15,7 +15,8 @@ from preprocess import get_pcqm4m_dataset
 from .data import CollateWithSPDLmdb, CollateWithSPDEdgeLmdb
 from .train import inf_iterator
 from .ZINC_preprocess import Zinc20_3D_LMDBDataset
-from models import GraphGPSEncoder, GraphGPSEncoder_CLS, GraphGPSEncoder_CLS_GraphormerSPD, GraphGPSEncoder_CLS_GPSSPD
+from models import GraphGPSEncoder, GraphGPSEncoder_CLS, GraphGPSEncoder_CLS_GraphormerSPD, GraphGPSEncoder_CLS_PEARL   
+from models import GraphGPSEncoder_CLS_GraphormerSPD_Pearl
 from models import MolPosDiffusion, MolPosDiffusion_condition, MolPosDiffusion_cat
     
 def build_logger(args, config, train: bool = True):
@@ -24,6 +25,8 @@ def build_logger(args, config, train: bool = True):
     train=False -> eval diffusion logs (no resume semantics)
     """
     tag = f"en{config.encoder.num_layers}_de{config.model.num_layers}_e_{config.encoder.name}_d_{config.model.model_type}"
+    if config.encoder.name in ['cls_pearl', 'cls_graphormer_pearl']:
+        tag = tag + f"_{config.encoder.pearl_fuse}"
 
     run_time = time.localtime()
     log_ts = time.strftime('%Y_%m_%d__%H_%M_%S', run_time)  # for log dir
@@ -177,7 +180,13 @@ def build_datasetLoader(config, logger, test_scale = None):
 
     return train_loader, val_loader, test_loader, train_iterator
 
-def build_encoder(cfg,device):
+def build_encoder(cfg,device, node_in_dim=None, edge_in_dim=None):
+    if node_in_dim != None:
+        cfg.data.node_in_dim = node_in_dim
+    if edge_in_dim != None:
+        cfg.data.edge_in_dim = edge_in_dim
+    
+
     cfg_encoder = cfg.encoder
     if cfg_encoder.name == 'normal':
         encoder = GraphGPSEncoder(
@@ -197,8 +206,14 @@ def build_encoder(cfg,device):
             node_in_dim=cfg.data.node_in_dim,
             edge_in_dim=cfg.data.edge_in_dim
         ).to(device)
-    elif cfg_encoder.name == 'cls_gps':
-        encoder = GraphGPSEncoder_CLS_GPSSPD(
+    elif cfg_encoder.name == 'cls_pearl':
+        encoder = GraphGPSEncoder_CLS_PEARL(
+            cfg_encoder,
+            node_in_dim=cfg.data.node_in_dim,
+            edge_in_dim=cfg.data.edge_in_dim
+        ).to(device)
+    elif cfg_encoder.name == 'cls_graphormer_pearl':
+        encoder = GraphGPSEncoder_CLS_GraphormerSPD_Pearl(
             cfg_encoder,
             node_in_dim=cfg.data.node_in_dim,
             edge_in_dim=cfg.data.edge_in_dim

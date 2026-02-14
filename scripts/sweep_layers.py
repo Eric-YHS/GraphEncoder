@@ -164,6 +164,8 @@ def main():
     ap.add_argument("--delta", type=int, default=4)
 
     ap.add_argument("--max_iters", type=int, default=0)
+    ap.add_argument("--pearl_fuse", type=str, default="concat")
+    
     args = ap.parse_args()
 
     # 建议：保持 cwd 不变（训练脚本/配置里可能依赖相对路径）
@@ -252,6 +254,7 @@ def main():
             "--model_layers", str(de),
             "--encoder_name", args.encoder_name,
             "--denoiser_name", args.denoiser_name,
+            "--pearl_fuse", args.pearl_fuse,
         ]
 
         cmd += resume_args

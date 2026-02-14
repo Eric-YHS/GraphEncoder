@@ -90,6 +90,8 @@ def update_config_with_args(config, args):
         config.encoder.name = args.encoder_name
     if args.denoiser_name is not None:
         config.model.model_type = args.denoiser_name
+    if args.pearl_fuse is not None:
+        config.encoder.pearl_fuse = args.pearl_fuse
 
     return config
 

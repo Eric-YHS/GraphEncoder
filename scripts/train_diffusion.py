@@ -127,7 +127,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--config', type=str, default='./configs/training.yml')
-    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--device', type=str, default='cuda:3')
     parser.add_argument('--logdir', type=str, default='./logs_diffusion')
     parser.add_argument('--train_report_iter', type=int, default=50)
     parser.add_argument('--encoder_layers', type=int, default=None)
@@ -135,6 +135,8 @@ if __name__ == '__main__':
     parser.add_argument('--exp_name', type=str, default='GraphGPS_Encoder')
     parser.add_argument('--encoder_name', type=str, default=None)
     parser.add_argument('--denoiser_name', type=str, default=None)
+    parser.add_argument('--pearl_fuse', type=str, default=None)
+    
 
     parser.add_argument('--resume', action='store_true', help='resume from existing log+ckpt')
     parser.add_argument('--resume_log_dir', type=str, default=None, help='existing log_dir to continue writing')
