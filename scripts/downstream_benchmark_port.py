@@ -1295,6 +1295,8 @@ def main():
     parser.add_argument("--embed_bs", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--model_name",type=str, default=None)
+    parser.add_argument("--pearl_fuse",type=str, default="concat")
+
 
     # encoder config: easiest is to load the SAME training yaml and pass cfg.encoder
     parser.add_argument("--train_config", type=str, required=False,default="configs/training.yml",
@@ -1314,6 +1316,7 @@ def main():
     cfg.encoder.num_layers = int(args.enlayer)
     cfg.encoder.name = args.encoder_name
     cfg.model.model_type = args.denoiser_name
+    cfg.encoder.pearl_fuse = args.pearl_fuse
 
     ckpt_file_name = f"en{args.enlayer}_de{args.delayer}_e_{args.encoder_name}_d_{args.denoiser_name}_{args.ckpt_date}"
     ckpt_path = os.path.join("./outputs/checkpoints/training", ckpt_file_name, "best.pt")

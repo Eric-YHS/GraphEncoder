@@ -79,7 +79,7 @@ PREPARED_DIR="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared"
 SCRIPT="scripts/downstream_benchmark_port.py"
 
 # GPUs to use (one dataset job gets one GPU; round-robin assignment)
-GPUS=(1 2)            # e.g. (0 1 2 3)
+GPUS=(0 1 2 3)            # e.g. (0 1 2 3)
 MAX_PARALLEL=8        # max concurrent dataset jobs per config
                       # 建议 MAX_PARALLEL <= ${#GPUS[@]}，否则同一GPU会被多个任务抢
 
@@ -115,13 +115,18 @@ export PYTHONUNBUFFERED=1
 # -------------------------
 # CONFIGS: one line per config
 # format: enlayer|delayer|encoder_name|denoiser_name|ckpt_date
+# TODO: format changed: enlayer|delayer|encoder_name|denoiser_name|ckpt_date|pearl_fuse
 # 你把下面示例改成你自己的 4 组即可
 # -------------------------
 CONFIGS=(
-  "9|5|cls_graphormer|uni_o2_condition|20260204-163653"
-  "9|5|cls_pearl|uni_o2_condition|20260204-175227"
-  "9|5|cls_pearl|uni_o2_condition|20260204-180020"
-  "9|5|cls_graphormer_pearl|uni_o2_condition|20260204-181909"
+  "9|5|cls_graphormer|uni_o2_condition|20260204-163653|add"
+  "9|5|cls_pearl|uni_o2_condition|20260204-175227|concat"
+  "9|5|cls_pearl|uni_o2_condition|20260204-180020|add"
+  "9|5|cls_graphormer_pearl|uni_o2_condition|20260204-181909|add"
+  "9|5|cls_graphormer|uni_o2_cat|20260207-095648|add"
+  "9|5|cls_pearl|uni_o2_cat|20260207-100118|add"
+  "9|5|cls_pearl|uni_o2_cat|20260207-100118|concat"
+  "9|5|cls_graphormer_pearl|uni_o2_cat|20260207-095648|add"
 )
 
 # -------------------------
@@ -402,7 +407,7 @@ for cfg in "${CONFIGS[@]}"; do
 
   echo
   echo "============================================================"
-  echo "[RUN] CONFIG ${idx}/${#CONFIGS[@]}: en=${en} de=${de} encoder=${encoder_name} denoiser=${denoiser_name} ckpt_date=${ckpt_date}"
+  echo "[RUN] CONFIG ${idx}/${#CONFIGS[@]}: en=${en} de=${de} encoder=${encoder_name} denoiser=${denoiser_name} ckpt_date=${ckpt_date} "
   echo "============================================================"
 
   if ! run_one_config "${en}" "${de}" "${encoder_name}" "${denoiser_name}" "${ckpt_date}"; then
