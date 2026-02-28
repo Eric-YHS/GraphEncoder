@@ -15,7 +15,7 @@ import shutil
 import argparse
 import logging as log
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import deque
 from ogb.utils.features import get_bond_feature_dims
 
@@ -43,7 +43,7 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.multioutput import MultiOutputClassifier
 from sklearn.metrics import make_scorer, roc_auc_score
 
-from utils.builder import build_encoder
+from utils.builder import build_encoder, build_ckpt
 
 # ====== optional skfp multioutput auroc (same as benchmark) ======
 try:
@@ -140,7 +140,7 @@ def json_numpy_obj_hook(d: Dict[str, Any]) -> Any:
 @dataclass
 class Dataset:
     name: str
-    task: Literal["classification", "regression"]
+    task: Any
     data: Any     # pd.DataFrame
     splits: Any   # dict
 
@@ -1277,25 +1277,27 @@ def run_downstream_from_prepared(
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prepared_path", type=str, default="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared/DILI.json",
+    parser.add_argument('--config', type=str, default='./configs/training.yml')
+    parser.add_argument("--prepared_path", type=str, default="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared/ogbg-molsider.json",
                         help="Path to prepared dataset (.json or .joblib), e.g. prepared/DILI.json")
     parser.add_argument("--prepared_spd_path", type=str, default="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared_spd_cache",
                         help="Path to prepared dataset (.json or .joblib), e.g. prepared/DILI.json")
-    parser.add_argument("--ckpt_date", type=str, default="20260204-163653",
-                        help="Path to your training checkpoint best.pt")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--out_dir", type=str, default="./logs_embedding/embedded_cache",
                         help="Where to store embeddings/preds/results (benchmark-like)")
     parser.add_argument("--illegal_smiles", type=str, default='./configs/illegal_smiles.txt',
                         help="Path to illegal_smiles.txt (optional)")
+
+    parser.add_argument("--ckpt_date", type=str, default="20260204-181909",help="Path to your training checkpoint best.pt")
     parser.add_argument("--enlayer",default=9)
     parser.add_argument("--delayer",default=5)
-    parser.add_argument("--encoder_name", default="cls_graphormer")
+    parser.add_argument("--encoder_name", default="cls_graphormer_pearl")
     parser.add_argument("--denoiser_name", default="uni_o2_condition")
-    parser.add_argument("--embed_bs", type=int, default=256)
+    parser.add_argument("--embed_bs", type=int, default=64)
+    parser.add_argument("--pearl_fuse",type=str, default="concat")
+
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--model_name",type=str, default=None)
-    parser.add_argument("--pearl_fuse",type=str, default="concat")
 
 
     # encoder config: easiest is to load the SAME training yaml and pass cfg.encoder
@@ -1318,8 +1320,8 @@ def main():
     cfg.model.model_type = args.denoiser_name
     cfg.encoder.pearl_fuse = args.pearl_fuse
 
-    ckpt_file_name = f"en{args.enlayer}_de{args.delayer}_e_{args.encoder_name}_d_{args.denoiser_name}_{args.ckpt_date}"
-    ckpt_path = os.path.join("./outputs/checkpoints/training", ckpt_file_name, "best.pt")
+    ckpt_path, meta = build_ckpt(args, cfg, train=False, run_time = args.ckpt_date)
+    ckpt_path = os.path.join(ckpt_path,"best.pt")
     if args.model_name is None:
         model_name = f"en{args.enlayer}_de{args.delayer}_e_{args.encoder_name}_d_{args.denoiser_name}"
     else:

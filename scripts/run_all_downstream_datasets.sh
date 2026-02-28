@@ -8,17 +8,6 @@ set -euo pipefail
 # - Finish this CONFIG -> move to next CONFIG
 #
 # Supports --detach to run in background even if terminal closes.
-#
-# Usage:
-#   chmod +x downstream_sweep_by_dataset.sh
-#   ./downstream_sweep_by_dataset.sh
-#   ./downstream_sweep_by_dataset.sh --detach
-#
-# Monitor:
-#   tail -f ./logs_downstream_sweep/daemon.log
-#
-# Stop:
-#   kill -TERM "$(cat ./logs_downstream_sweep/daemon.pid)"
 # ============================================================
 
 # -------------------------
@@ -64,7 +53,6 @@ if [[ "${DETACH}" -eq 1 && "${DETACHED:-0}" -eq 0 ]]; then
   exit 0
 fi
 
-# Kill the whole process group (all background python jobs)
 cleanup() {
   echo "[SIGNAL] received, terminating process group..."
   kill -- -$$ 2>/dev/null || true
@@ -78,32 +66,22 @@ trap cleanup INT TERM
 PREPARED_DIR="/mnt2/luyifeng/diff4MoleculeRepresentation/data/prepared"
 SCRIPT="scripts/downstream_benchmark_port.py"
 
-# GPUs to use (one dataset job gets one GPU; round-robin assignment)
-GPUS=(0 1 2 3)            # e.g. (0 1 2 3)
-MAX_PARALLEL=8        # max concurrent dataset jobs per config
-                      # 建议 MAX_PARALLEL <= ${#GPUS[@]}，否则同一GPU会被多个任务抢
+GPUS=(0 1 2 3)
+MAX_PARALLEL=8
 
-# Embedding performance knobs
-EMBED_BS=256
+EMBED_BS=64
 NUM_WORKERS=0
 
-# Results/logs root (统一放一起)
 RUN_TS="$(date +"%Y_%m%d-%H%M%S")"
 ROOT_DIR="./logs_downstream_sweep_runs/${RUN_TS}"
 LOG_ROOT="${ROOT_DIR}/logs"
 RESULT_ROOT="${ROOT_DIR}/results"
 mkdir -p "${LOG_ROOT}" "${RESULT_ROOT}"
 
-# Skip some datasets if you want (按 prepared 文件名，不含 .json)
 EXCLUDE_DATASETS=(
-
 )
 
-
-# Reduce warning spam (optional)
 export PYTHONWARNINGS="ignore::UserWarning,ignore::FutureWarning"
-
-# Limit CPU threads per process (optional, helps avoid CPU爆)
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -113,20 +91,18 @@ export LOKY_MAX_CPU_COUNT=2
 export PYTHONUNBUFFERED=1
 
 # -------------------------
-# CONFIGS: one line per config
-# format: enlayer|delayer|encoder_name|denoiser_name|ckpt_date
-# TODO: format changed: enlayer|delayer|encoder_name|denoiser_name|ckpt_date|pearl_fuse
-# 你把下面示例改成你自己的 4 组即可
+# CONFIGS
+# format: enlayer|delayer|encoder_name|denoiser_name|ckpt_date|pearl_fuse
 # -------------------------
 CONFIGS=(
-  "9|5|cls_graphormer|uni_o2_condition|20260204-163653|add"
+  "9|5|cls_graphormer|uni_o2_condition|20260204-163653|concat"
   "9|5|cls_pearl|uni_o2_condition|20260204-175227|concat"
   "9|5|cls_pearl|uni_o2_condition|20260204-180020|add"
-  "9|5|cls_graphormer_pearl|uni_o2_condition|20260204-181909|add"
-  "9|5|cls_graphormer|uni_o2_cat|20260207-095648|add"
+  "9|5|cls_graphormer_pearl|uni_o2_condition|20260204-181909|concat"
+  "9|5|cls_graphormer|uni_o2_cat|20260207-095648|concat"
   "9|5|cls_pearl|uni_o2_cat|20260207-100118|add"
   "9|5|cls_pearl|uni_o2_cat|20260207-100118|concat"
-  "9|5|cls_graphormer_pearl|uni_o2_cat|20260207-095648|add"
+  "9|5|cls_graphormer_pearl|uni_o2_cat|20260207-095648|concat"
 )
 
 # -------------------------
@@ -152,18 +128,18 @@ in_array() {
 }
 
 merge_one_config_results() {
-  local out_dir="$1"        # e.g. results/<cfg_tag>
-  local model_name="$2"     # e.g. GraphGPS_Encoder_<cfg_tag>
+  local out_dir="$1"
+  local model_name="$2"
   local en="$3"
   local de="$4"
   local encoder_name="$5"
   local denoiser_name="$6"
   local ckpt_date="$7"
-  local cfg_tag="$8"
+  local pearl_fuse="$8"
+  local cfg_tag="$9"
 
   local merged_csv="${out_dir}/ALL_${model_name}_results.csv"
 
-  # 找到该 config 下每个数据集产出的 results.csv
   mapfile -t CSV_FILES < <(find "${out_dir}" -type f -name "${model_name}_results.csv" | sort)
 
   if [[ ${#CSV_FILES[@]} -eq 0 ]]; then
@@ -178,21 +154,21 @@ merge_one_config_results() {
   for f in "${CSV_FILES[@]}"; do
     [[ -s "$f" ]] || { echo "[MERGE-WARN] Skip empty: $f"; continue; }
     if [[ $first -eq 1 ]]; then
-      # header + extra columns
-      head -n 1 "$f" | awk -v OFS=',' '{print $0,"enlayer","delayer","encoder_name","denoiser_name","ckpt_date","config_tag"}' >> "$tmpfile"
-      tail -n +2 "$f" | awk -v OFS=',' -v en="$en" -v de="$de" -v e="$encoder_name" -v d="$denoiser_name" -v c="$ckpt_date" -v t="$cfg_tag" \
-        '{print $0,en,de,e,d,c,t}' >> "$tmpfile"
+      head -n 1 "$f" | awk -v OFS=',' '{print $0,"enlayer","delayer","encoder_name","denoiser_name","ckpt_date","pearl_fuse","config_tag"}' >> "$tmpfile"
+      tail -n +2 "$f" | awk -v OFS=',' \
+        -v en="$en" -v de="$de" -v e="$encoder_name" -v d="$denoiser_name" -v c="$ckpt_date" -v p="$pearl_fuse" -v t="$cfg_tag" \
+        '{print $0,en,de,e,d,c,p,t}' >> "$tmpfile"
       first=0
     else
-      tail -n +2 "$f" | awk -v OFS=',' -v en="$en" -v de="$de" -v e="$encoder_name" -v d="$denoiser_name" -v c="$ckpt_date" -v t="$cfg_tag" \
-        '{print $0,en,de,e,d,c,t}' >> "$tmpfile"
+      tail -n +2 "$f" | awk -v OFS=',' \
+        -v en="$en" -v de="$de" -v e="$encoder_name" -v d="$denoiser_name" -v c="$ckpt_date" -v p="$pearl_fuse" -v t="$cfg_tag" \
+        '{print $0,en,de,e,d,c,p,t}' >> "$tmpfile"
     fi
   done
 
   mv "$tmpfile" "${merged_csv}"
   echo "[MERGE-DONE] ${cfg_tag} -> ${merged_csv} | files=${#CSV_FILES[@]}"
 }
-
 
 # -------------------------
 # 1) Collect datasets
@@ -224,7 +200,6 @@ echo "[INFO] GPUs: ${GPUS[*]} | MAX_PARALLEL=${MAX_PARALLEL}"
 echo "[INFO] Logs:    ${LOG_ROOT}"
 echo "[INFO] Results: ${RESULT_ROOT}"
 
-# Safety: avoid MAX_PARALLEL > number of GPUs by default
 if [[ "${MAX_PARALLEL}" -gt "${#GPUS[@]}" ]]; then
   echo "[WARN] MAX_PARALLEL (${MAX_PARALLEL}) > #GPUs (${#GPUS[@]}). Multiple jobs may share the same GPU."
 fi
@@ -239,18 +214,18 @@ run_one_dataset_job() {
   local encoder_name="$4"
   local denoiser_name="$5"
   local ckpt_date="$6"
-  local ds_path="$7"
-  local gpu_id="$8"
-  local out_dir="$9"
-  local log_path="${10}"
-  local model_name="${11}"
+  local pearl_fuse="$7"
+  local ds_path="$8"
+  local gpu_id="$9"
+  local out_dir="${10}"
+  local log_path="${11}"
+  local model_name="${12}"
 
   local ds_base
   ds_base="$(basename "${ds_path}" .json)"
 
   mkdir -p "$(dirname "${log_path}")" "${out_dir}"
 
-  # Skip if results already exist
   local expected_csv="${out_dir}/${ds_base}/${model_name}_results.csv"
   if [[ -s "${expected_csv}" ]]; then
     echo "[SKIP] ${cfg_tag} | ${ds_base} (exists: ${expected_csv})"
@@ -278,10 +253,10 @@ run_one_dataset_job() {
     echo "  --encoder_name ${encoder_name} \\"
     echo "  --denoiser_name ${denoiser_name} \\"
     echo "  --ckpt_date ${ckpt_date} \\"
+    echo "  --pearl_fuse ${pearl_fuse} \\"
     echo "============================================================"
     echo
   } > "${log_path}"
-
 
   CUDA_VISIBLE_DEVICES="${gpu_id}" \
     python -u "${SCRIPT}" \
@@ -296,14 +271,14 @@ run_one_dataset_job() {
       --encoder_name "${encoder_name}" \
       --denoiser_name "${denoiser_name}" \
       --ckpt_date "${ckpt_date}" \
+      --pearl_fuse "${pearl_fuse}" \
       >> "${log_path}" 2>&1
-
 
   echo "# END $(date)" >> "${log_path}"
 }
 
 # -------------------------
-# 3) Run one config: dataset-parallel with a max concurrency
+# 3) Run one config
 # -------------------------
 run_one_config() {
   local en="$1"
@@ -311,8 +286,10 @@ run_one_config() {
   local encoder_name="$3"
   local denoiser_name="$4"
   local ckpt_date="$5"
+  local pearl_fuse="$6"
 
-  local cfg_tag_raw="en${en}_de${de}_e_${encoder_name}_d_${denoiser_name}_${ckpt_date}"
+  # pearl_fuse 进 tag，避免 add/concat 覆盖同一目录/同一 model_name
+  local cfg_tag_raw="en${en}_de${de}_e_${encoder_name}_d_${denoiser_name}_pf_${pearl_fuse}_${ckpt_date}"
   local cfg_tag
   cfg_tag="$(sanitize "${cfg_tag_raw}")"
 
@@ -320,7 +297,6 @@ run_one_config() {
   local cfg_log_dir="${LOG_ROOT}/${cfg_tag}"
   mkdir -p "${out_dir}" "${cfg_log_dir}"
 
-  # model_name 决定结果文件名，建议跟配置绑定，避免不同配置互相覆盖
   local model_name="GraphGPS_Encoder_${cfg_tag}"
 
   echo
@@ -330,9 +306,7 @@ run_one_config() {
   echo "  model_name: ${model_name}"
   echo
 
-  # Job control
   declare -a PIDS=()
-  declare -a DESCS=()
   local active=0
   local launched=0
   local fail=0
@@ -341,11 +315,9 @@ run_one_config() {
     local ds_base
     ds_base="$(basename "${ds_path}" .json)"
 
-    # pick GPU round-robin by launch index
     local gpu_id="${GPUS[$((launched % ${#GPUS[@]}))]}"
     local log_path="${cfg_log_dir}/${ds_base}.gpu${gpu_id}.log"
 
-    # throttle: if too many active, wait for one to finish
     while [[ "${active}" -ge "${MAX_PARALLEL}" ]]; do
       if wait -n; then
         active=$((active-1))
@@ -355,22 +327,19 @@ run_one_config() {
       fi
     done
 
-    # launch job
     run_one_dataset_job \
       "${cfg_tag_raw}" \
-      "${en}" "${de}" "${encoder_name}" "${denoiser_name}" "${ckpt_date}" \
+      "${en}" "${de}" "${encoder_name}" "${denoiser_name}" "${ckpt_date}" "${pearl_fuse}" \
       "${ds_path}" "${gpu_id}" \
       "${out_dir}" "${log_path}" \
       "${model_name}" &
 
     PIDS+=("$!")
-    DESCS+=("${ds_base}@gpu${gpu_id}")
     active=$((active+1))
     launched=$((launched+1))
     echo "[LAUNCH] ${cfg_tag_raw} | ${ds_base} on gpu${gpu_id} | pid=${PIDS[-1]}"
   done
 
-  # wait remaining
   for pid in "${PIDS[@]}"; do
     if wait "${pid}"; then
       :
@@ -388,11 +357,9 @@ run_one_config() {
   echo "  results: ${out_dir}"
   echo "  logs:    ${cfg_log_dir}"
 
-  # ✅ merge all datasets into one CSV for this config
   merge_one_config_results \
     "${out_dir}" "${model_name}" \
-    "${en}" "${de}" "${encoder_name}" "${denoiser_name}" "${ckpt_date}" "${cfg_tag}"
-
+    "${en}" "${de}" "${encoder_name}" "${denoiser_name}" "${ckpt_date}" "${pearl_fuse}" "${cfg_tag}"
 }
 
 # -------------------------
@@ -403,14 +370,15 @@ idx=0
 
 for cfg in "${CONFIGS[@]}"; do
   idx=$((idx+1))
-  IFS='|' read -r en de encoder_name denoiser_name ckpt_date <<< "${cfg}"
+  IFS='|' read -r en de encoder_name denoiser_name ckpt_date pearl_fuse <<< "${cfg}"
+  pearl_fuse="${pearl_fuse:-none}"   # 兼容老的 5 段格式
 
   echo
   echo "============================================================"
-  echo "[RUN] CONFIG ${idx}/${#CONFIGS[@]}: en=${en} de=${de} encoder=${encoder_name} denoiser=${denoiser_name} ckpt_date=${ckpt_date} "
+  echo "[RUN] CONFIG ${idx}/${#CONFIGS[@]}: en=${en} de=${de} encoder=${encoder_name} denoiser=${denoiser_name} ckpt_date=${ckpt_date} pearl_fuse=${pearl_fuse}"
   echo "============================================================"
 
-  if ! run_one_config "${en}" "${de}" "${encoder_name}" "${denoiser_name}" "${ckpt_date}"; then
+  if ! run_one_config "${en}" "${de}" "${encoder_name}" "${denoiser_name}" "${ckpt_date}" "${pearl_fuse}"; then
     overall_fail=1
     break
   fi

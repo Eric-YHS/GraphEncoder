@@ -385,7 +385,7 @@ class MolPosDiffusion(nn.Module):
         bond_edge_attr = batch.edge_attr.float()
         batch_id = batch.batch
 
-        pos0, _, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
+        pos0, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
 
         num_graphs = batch_id.max().item() + 1
         if time_step is None:
@@ -440,9 +440,9 @@ class MolPosDiffusion(nn.Module):
 
     def _model_pred_to_x0(self, x_t: torch.Tensor, model_out_x: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
         """
-        将网络输出解释成 x0_pred
-        - mean_type=C0: model_out_x 就是 x0
-        - mean_type=noise: model_out_x 是 eps
+        explain x0_pred from model_out_x
+        - mean_type=C0: model_out_x is x0
+        - mean_type=noise: model_out_x is eps
         """
         if self.model_mean_type == "C0":
             return model_out_x
@@ -471,10 +471,6 @@ class MolPosDiffusion(nn.Module):
         bond_edge_index = batch_obj.edge_index
         bond_edge_attr = batch_obj.edge_attr.float() if hasattr(batch_obj, "edge_attr") and batch_obj.edge_attr is not None else None
 
-        # 保持居中，减少漂移
-        if self.center_pos_mode != "none":
-            x_t, _, _ = center_pos_mol(x_t, batch_id, mode=self.center_pos_mode)
-
         out = self.forward(
             pos_t=x_t,
             x=x,
@@ -489,6 +485,7 @@ class MolPosDiffusion(nn.Module):
         model_out = out["x"]  # [N,3]（解释为 x0 或 eps）
 
         x0_pred = self._model_pred_to_x0(x_t, model_out, t, batch_id)       # [N,3]
+        x0_pred, _ = center_pos_mol(x0_pred, batch_id, mode=self.center_pos_mode)
         mean = self.q_pos_posterior_mean(x0_pred, x_t, t, batch_id)         # [N,3]
         logvar = extract(self.posterior_logvar, t, batch_id)                # [N,1]
 
@@ -503,7 +500,7 @@ class MolPosDiffusion(nn.Module):
         t: torch.Tensor,              # [B] long
     ):
         """
-        单步采样：x_{t-1} ~ N(mean, var)
+        单步采样: x_{t-1} ~ N(mean, var)
         """
         mean, logvar, x0_pred = self.p_mean_variance(
             batch_obj=batch_obj,
@@ -518,9 +515,6 @@ class MolPosDiffusion(nn.Module):
         else:
             noise = torch.randn_like(x_t)
             x_prev = mean + torch.exp(0.5 * logvar) * noise
-
-        if self.center_pos_mode != "none":
-            x_prev, _, _ = center_pos_mol(x_prev, batch_obj.batch, mode=self.center_pos_mode)
 
         return x_prev, x0_pred
 
@@ -541,9 +535,6 @@ class MolPosDiffusion(nn.Module):
         N = batch_obj.x.size(0)
 
         x_t = torch.randn((N, 3), device=device) if x_T is None else x_T
-
-        if self.center_pos_mode != "none":
-            x_t, _, _ = center_pos_mol(x_t, batch_id, mode=self.center_pos_mode)
 
         traj = []
         for step in reversed(range(self.num_timesteps)):
@@ -594,8 +585,6 @@ class MolPosDiffusion(nn.Module):
         B = int(batch_id.max().item()) + 1
 
         x_cur = x_t
-        if self.center_pos_mode != "none":
-            x_cur, _, _ = center_pos_mol(x_cur, batch_id, mode=self.center_pos_mode)
 
         traj = []
         for step in reversed(range(t_start + 1)):
@@ -628,8 +617,7 @@ class MolPosDiffusion(nn.Module):
         t_graph = torch.full((B,), t_start, device=x0.device, dtype=torch.long)
 
         x0c = x0
-        if self.center_pos_mode != "none":
-            x0c, _, _ = center_pos_mol(x0c, batch_id, mode=self.center_pos_mode)
+        x0c, _ = center_pos_mol(x0c, batch_id, mode=self.center_pos_mode)
 
         x_t, _ = self.q_pos_sample(x0c, t_graph, batch_id)
         return self.reconstruct_from_noisy(
@@ -772,7 +760,6 @@ class MolPosDiffusion_condition(nn.Module):
 
     def sample_time(self, num_graphs, device, method):
         if method == 'importance':
-            # ✅ 修：self.Lt_count 现在存在
             if not (self.Lt_count > 10).all():
                 return self.sample_time(num_graphs, device, method='symmetric')
             Lt_sqrt = torch.sqrt(self.Lt_history + 1e-10) + 1e-4
@@ -796,7 +783,7 @@ class MolPosDiffusion_condition(nn.Module):
         x,
         batch,
         cond_node_emb,
-        graph_emb,                 # ✅ NEW
+        graph_emb,                
         time_step,
         bond_edge_index=None,
         bond_edge_attr=None,
@@ -818,6 +805,7 @@ class MolPosDiffusion_condition(nn.Module):
         # ---- project node & graph conditions
         hc_node = self.cond_proj(cond_node_emb)  # [N,H]
         
+        # random dropout node embeddings
         if self.training and self.node_dropout > 0:
             keep_prob = 1.0 - self.node_dropout
             if self.node_dropout_type in ["node", "both"]:
@@ -865,10 +853,11 @@ class MolPosDiffusion_condition(nn.Module):
         pos0 = batch.pos
         x = batch.x
         bond_edge_index = batch.edge_index
-        bond_edge_attr = batch.edge_attr.float()
+        bond_edge_attr = batch.edge_attr.float() if getattr(batch, "edge_attr", None) is not None else None
+
         batch_id = batch.batch
 
-        pos0, _, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
+        pos0, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
 
         num_graphs = batch_id.max().item() + 1
         if time_step is None:
@@ -916,12 +905,12 @@ class MolPosDiffusion_condition(nn.Module):
         # x: [N,3]
         if self.center_pos_mode == "none":
             return x
-        x, _, _ = center_pos_mol(x, batch, mode=self.center_pos_mode)
+        x, _ = center_pos_mol(x, batch, mode=self.center_pos_mode)
         return x
 
-    def _com_free_noise_like(self, ref: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        z = torch.randn_like(ref)
-        return self._center_graph(z, batch)  # 让噪声本身每个图零均值（CoM-free）
+    # def _com_free_noise_like(self, ref: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+    #     z = torch.randn_like(ref)
+    #     return self._center_graph(z, batch)  # 让噪声本身每个图零均值（CoM-free）
 
     def _predict_x0_from_eps(self, x_t: torch.Tensor, eps: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
         """
@@ -960,7 +949,7 @@ class MolPosDiffusion_condition(nn.Module):
         batch_id = batch_obj.batch
         x = batch_obj.x
         bond_edge_index = batch_obj.edge_index
-        bond_edge_attr = batch_obj.edge_attr if getattr(batch_obj, "edge_attr", None) is not None else None
+        bond_edge_attr = batch_obj.edge_attr.float() if getattr(batch_obj, "edge_attr", None) is not None else None
 
         out = self.forward(
             pos_t=x_t,
@@ -977,40 +966,29 @@ class MolPosDiffusion_condition(nn.Module):
         )
         model_out = out["x"]  # interpret according to model_mean_type
 
-        # --- convert model output -> x0_pred ---
         x0_pred = self._model_pred_to_x0(x_t, model_out, t, batch_id)
 
         if clip_x0:
-            # 位置一般不建议硬 clip，但可以先留一个开关便于 debug
             x0_pred = x0_pred.clamp(min=-20.0, max=20.0)
+        x0_pred, _ = center_pos_mol(x0_pred, batch_id, mode=self.center_pos_mode)
 
-        # --- posterior mean/var (DDPM aligned) ---
         mean = self.q_pos_posterior_mean(x0_pred, x_t, t, batch_id)
-
-        # posterior variance 更稳（你初始化里已经算好了）
-        # 用 posterior_logvar 也行（数值更稳定）
         logvar = extract(self.posterior_logvar, t, batch_id)  # [N,1]
-        # 或者：
-        # var = extract(self.posterior_var, t, batch_id)
-        # logvar = torch.log(var.clamp(min=1e-20))
-
-        # 保持 CoM-free（如果你训练时就是这么做的）
-        mean = self._center_graph(mean, batch_id)
 
         return mean, logvar, x0_pred
 
     @torch.no_grad()
     def p_sample(self, batch_obj, x_t, cond_node_emb, graph_emb, t,
-                unconditioned: bool = False,
-                deterministic: bool = False):
-        batch_id = batch_obj.batch
-        mu, logvar, x0_pred = self.p_mean_variance(batch_obj, x_t, cond_node_emb, graph_emb, t, unconditioned)
+                unconditioned: bool = False):
+        # batch_id = batch_obj.batch
+        mean, logvar, x0_pred = self.p_mean_variance(batch_obj, x_t, cond_node_emb, graph_emb, t, unconditioned)
 
-        if deterministic or (t == 0).all():
-            x_prev = mu
+        if (t == 0).all():
+            x_prev = mean
         else:
-            z = self._com_free_noise_like(x_t, batch_id)
-            x_prev = mu + torch.exp(0.5 * logvar) * z
+            # z = self._com_free_noise_like(x_t, batch_id)
+            z = torch.randn_like(x_t)
+            x_prev = mean + torch.exp(0.5 * logvar) * z
 
         return x_prev, x0_pred
 
@@ -1024,20 +1002,13 @@ class MolPosDiffusion_condition(nn.Module):
         x_T = None,
         return_traj: bool = False,
         unconditioned: bool = False,
-        deterministic: bool = False,
-        center_output: bool = True,
     ):
         device = batch_obj.x.device
         batch_id = batch_obj.batch
         B = int(batch_id.max().item()) + 1
         N = batch_obj.x.size(0)
 
-        if x_T is None:
-            x_t = torch.randn((N, 3), device=device)
-            x_t = self._center_graph(x_t, batch_id)
-        else:
-            x_t = x_T
-            x_t = self._center_graph(x_t, batch_id)
+        x_t = x_T if x_T is not None else torch.randn((N, 3), device=device)
 
         traj = []
         for step in reversed(range(self.num_timesteps)):
@@ -1045,13 +1016,9 @@ class MolPosDiffusion_condition(nn.Module):
             x_t, _ = self.p_sample(
                 batch_obj, x_t, cond_node_emb, graph_emb, t_graph,
                 unconditioned=unconditioned,
-                deterministic=deterministic,
             )
             if return_traj:
                 traj.append(x_t.detach().cpu())
-
-        if center_output and self.center_pos_mode != "none":
-            x_t = self._center_graph(x_t, batch_id)
 
         return (x_t, traj) if return_traj else x_t
 
@@ -1064,8 +1031,6 @@ class MolPosDiffusion_condition(nn.Module):
             batch_obj, cond_node_emb, graph_emb,
             x_T=None,
             return_traj=return_traj,
-            deterministic=False,
-            center_output=True,
         )
 
     @torch.no_grad()
@@ -1077,20 +1042,17 @@ class MolPosDiffusion_condition(nn.Module):
         cond_node_emb: torch.Tensor,
         graph_emb: torch.Tensor,
         return_traj: bool = False,
-        deterministic: bool = True,     # ✅ 重建建议默认 deterministic
     ):
         device = batch_obj.x.device
         batch_id = batch_obj.batch
         B = int(batch_id.max().item()) + 1
-
-        x_cur = self._center_graph(x_t, batch_id)
+        x_cur = x_t
         traj = []
 
         for step in reversed(range(t_start + 1)):
             t_graph = torch.full((B,), step, device=device, dtype=torch.long)
             x_cur, _ = self.p_sample(
                 batch_obj, x_cur, cond_node_emb, graph_emb, t_graph,
-                deterministic=deterministic,
             )
             if return_traj:
                 traj.append(x_cur.detach().cpu())
@@ -1115,7 +1077,7 @@ class MolPosDiffusion_condition(nn.Module):
         B = int(batch_id.max().item()) + 1
         t_graph = torch.full((B,), t_start, device=x0.device, dtype=torch.long)
 
-        x0c = self._center_graph(x0, batch_id)    # ✅ 对齐训练（你训练时 center_pos_mol 了）
+        x0c = self._center_graph(x0, batch_id)
         x_t, _ = self.q_pos_sample(x0c, t_graph, batch_id)
 
         return self.reconstruct_from_noisy(
@@ -1125,7 +1087,6 @@ class MolPosDiffusion_condition(nn.Module):
             cond_node_emb=cond_node_emb,
             graph_emb=graph_emb,
             return_traj=return_traj,
-            deterministic=deterministic,
         )
 
 
@@ -1339,7 +1300,7 @@ class MolPosDiffusion_cat(nn.Module):
         bond_edge_attr = batch.edge_attr.float()
         batch_id = batch.batch
 
-        pos0, _, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
+        pos0, _ = center_pos_mol(pos0, batch_id, mode=self.center_pos_mode)
 
         num_graphs = batch_id.max().item() + 1
         if time_step is None:
@@ -1429,10 +1390,6 @@ class MolPosDiffusion_cat(nn.Module):
         bond_edge_index = batch_obj.edge_index
         bond_edge_attr = batch_obj.edge_attr.float() if hasattr(batch_obj, "edge_attr") and batch_obj.edge_attr is not None else None
 
-        # 保持居中，减少漂移
-        if self.center_pos_mode != "none":
-            x_t, _, _ = center_pos_mol(x_t, batch_id, mode=self.center_pos_mode)
-
         out = self.forward(
             pos_t=x_t,
             x=x,
@@ -1448,6 +1405,7 @@ class MolPosDiffusion_cat(nn.Module):
         model_out = out["x"]  # [N,3]（解释为 x0 或 eps）
 
         x0_pred = self._model_pred_to_x0(x_t, model_out, t, batch_id)       # [N,3]
+        x0_pred, _ = center_pos_mol(x0_pred, batch_id, mode=self.center_pos_mode)
         mean = self.q_pos_posterior_mean(x0_pred, x_t, t, batch_id)         # [N,3]
         logvar = extract(self.posterior_logvar, t, batch_id)                # [N,1]
 
@@ -1480,9 +1438,6 @@ class MolPosDiffusion_cat(nn.Module):
             noise = torch.randn_like(x_t)
             x_prev = mean + torch.exp(0.5 * logvar) * noise
 
-        if self.center_pos_mode != "none":
-            x_prev, _, _ = center_pos_mol(x_prev, batch_obj.batch, mode=self.center_pos_mode)
-
         return x_prev, x0_pred
 
     @torch.no_grad()
@@ -1503,9 +1458,6 @@ class MolPosDiffusion_cat(nn.Module):
         N = batch_obj.x.size(0)
 
         x_t = torch.randn((N, 3), device=device) if x_T is None else x_T
-
-        if self.center_pos_mode != "none":
-            x_t, _, _ = center_pos_mol(x_t, batch_id, mode=self.center_pos_mode)
 
         traj = []
         for step in reversed(range(self.num_timesteps)):
@@ -1535,7 +1487,7 @@ class MolPosDiffusion_cat(nn.Module):
         return_traj: bool = False,
     ):
         """
-        纯噪声生成：x_T ~ N(0,I) -> x0
+        pure noise generation: x_T ~ N(0,I) -> x0
         """
         return self.p_sample_loop(
             batch_obj=batch_obj,
@@ -1549,8 +1501,8 @@ class MolPosDiffusion_cat(nn.Module):
     def reconstruct_from_noisy(
         self,
         batch_obj,
-        x_t: torch.Tensor,            # 给定某个噪声步的坐标 [N,3]
-        t_start: int,                 # 从 t_start 开始反推到 0
+        x_t: torch.Tensor,            # given noisy coords [N,3]
+        t_start: int,                 # reverse from t_start to 0
         cond_node_emb: torch.Tensor,
         graph_emb: torch.Tensor,
         return_traj: bool = False,
@@ -1560,8 +1512,6 @@ class MolPosDiffusion_cat(nn.Module):
         B = int(batch_id.max().item()) + 1
 
         x_cur = x_t
-        if self.center_pos_mode != "none":
-            x_cur, _, _ = center_pos_mol(x_cur, batch_id, mode=self.center_pos_mode)
 
         traj = []
         for step in reversed(range(t_start + 1)):
@@ -1582,22 +1532,21 @@ class MolPosDiffusion_cat(nn.Module):
     def reconstruct_from_clean(
         self,
         batch_obj,
-        x0: torch.Tensor,             # 干净坐标 [N,3]
+        x0: torch.Tensor,             # clean coords [N,3]
         t_start: int,
         cond_node_emb: torch.Tensor,
         graph_emb: torch.Tensor,
         return_traj: bool = False,
     ):
         """
-        先 q_sample 加噪到 x_t_start，然后反推回 x0
+        first q_sample to x_t_start, then reverse to x0
         """
         batch_id = batch_obj.batch
         B = int(batch_id.max().item()) + 1
         t_graph = torch.full((B,), t_start, device=x0.device, dtype=torch.long)
 
         x0c = x0
-        if self.center_pos_mode != "none":
-            x0c, _, _ = center_pos_mol(x0c, batch_id, mode=self.center_pos_mode)
+        x0c, _ = center_pos_mol(x0c, batch_id, mode=self.center_pos_mode)
 
         x_t, _ = self.q_pos_sample(x0c, t_graph, batch_id)
         return self.reconstruct_from_noisy(
@@ -1618,37 +1567,17 @@ def extract(coef, t, batch):
 def center_pos_mol(pos: torch.Tensor,
                    batch: torch.Tensor,
                    mode: str = "graph",
-                   normalize: bool = False,
-                   eps: float = 1e-8):
+                   ):
 
     B = batch.max().item() + 1
 
     if mode == "none":
         offset = torch.zeros((B, 3), device=pos.device, dtype=pos.dtype)
-        scale = torch.ones(B, device=pos.device, dtype=pos.dtype)
-        return pos, offset[batch], scale[batch]
+        return pos, offset[batch]
 
     if mode == "graph":
         offset = scatter_mean(pos, batch, dim=0)          # [B,3]
         pos_center = pos - offset[batch]   
-                       # [N,3]
-
-        # return pos_center, offset[batch]
-
-        # if normalize:
-        #     # 每个节点到质心的平方距离
-        #     dist2 = (pos_center ** 2).sum(dim=-1)             # [N]
-        #     # 按图平均 -> 每个图的均方距离
-        #     mean_dist2 = scatter_mean(dist2, batch, dim=0)    # [B]
-        #     scale = torch.sqrt(mean_dist2 + eps)              # [B]
-
-        #     # 避免 scale 太小（极端情况，单原子）
-        #     scale = torch.clamp(scale, min=eps)
-
-        #     pos_center = pos_center / scale[batch].unsqueeze(-1)  # [N,3]
-        #     return pos_center, offset[batch], scale[batch]
-        # else:
-        scale = torch.ones(B, device=pos.device, dtype=pos.dtype)
-        return pos_center, offset[batch], scale 
+        return pos_center, offset[batch] 
 
     raise ValueError(mode)

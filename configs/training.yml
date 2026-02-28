@@ -24,7 +24,7 @@ encoder:
   pearl_num_layers: 4
   pearl_dropout: 0.1
   pearl_deterministic_eval: True
-  pearl_fuse: "concat"      # add or concat
+  pearl_fuse: "concat"      # add/concat
 
 model:
   model_mean_type: C0  # ['noise', 'C0']

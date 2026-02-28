@@ -40,6 +40,9 @@ class GraphCondEmbedder(nn.Module):
         unconditioned: bool = False,
     ) -> torch.Tensor:
         assert graph_emb.dim() == 2, "graph_embedding must be [num_graphs, graph_emb_dim]"
+        num_graphs = int(batch.max().item()) + 1
+        assert graph_emb.size(0) == num_graphs, f"graph_emb B={graph_emb.size(0)} != num_graphs={num_graphs}"
+
         B = graph_emb.size(0)
         device = graph_emb.device
 
@@ -399,18 +402,16 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
         cond_node = None
         if self.graph_cond_embedder is not None:
             if graph_embedding is None:
-                # no condition provided -> treat as unconditional
-                unconditioned = True
-                # make a dummy tensor to satisfy embedder shape, if you want strict behavior
-                # but simplest: just skip cond_node, model behaves like original
-                cond_node = None
-            else:
-                cond_node = self.graph_cond_embedder(
-                    graph_emb=graph_embedding,
-                    batch=batch,
-                    training=self.training,
-                    unconditioned=unconditioned
-                )  # [N, hidden_dim]
+                raise ValueError(
+                    "graph_cond_dim>0 but graph_embedding is None. "
+                    "You are calling the CFG denoiser without global condition."
+                )
+            cond_node = self.graph_cond_embedder(
+                graph_emb=graph_embedding,
+                batch=batch,
+                training=self.training,
+                unconditioned=unconditioned
+            )  # [N, hidden_dim]
 
         all_x = [x]
         all_h = [h]
@@ -443,6 +444,7 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
                 assert edge_attr.shape[-1] == self.edge_feat_dim
             else:
                 edge_attr = edge_type_feat
+                assert self.edge_feat_dim == 2, f"bond_edge_attr is None -> edge_attr dim=2, but edge_feat_dim={self.edge_feat_dim}"
 
             if self.ew_net_type == 'global':
                 dist = torch.norm(x[dst] - x[src], p=2, dim=-1, keepdim=True)

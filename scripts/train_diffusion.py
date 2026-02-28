@@ -18,7 +18,7 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 import utils.misc as misc
-from utils.builder import build_encoder, build_diffusion, build_datasetLoader, build_logger
+from utils.builder import *
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -125,14 +125,13 @@ def find_log_file_to_append(log_dir: str) -> str:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-
     parser.add_argument('--config', type=str, default='./configs/training.yml')
     parser.add_argument('--device', type=str, default='cuda:3')
     parser.add_argument('--logdir', type=str, default='./logs_diffusion')
     parser.add_argument('--train_report_iter', type=int, default=50)
+    parser.add_argument('--exp_name', type=str, default='GraphGPS_Encoder')
     parser.add_argument('--encoder_layers', type=int, default=None)
     parser.add_argument('--model_layers', type=int, default=None)
-    parser.add_argument('--exp_name', type=str, default='GraphGPS_Encoder')
     parser.add_argument('--encoder_name', type=str, default=None)
     parser.add_argument('--denoiser_name', type=str, default=None)
     parser.add_argument('--pearl_fuse', type=str, default=None)
@@ -163,7 +162,8 @@ if __name__ == '__main__':
     config = misc.update_config_with_args(config, args)
 
     # Logging / dirs
-    logger, writer, log_dir, ckpt_dir = build_logger(args, config, train=True)
+    ckpt_dir, meta = build_ckpt(args, config, train=True, run_time=None, create_dir=True)
+    logger, writer, log_dir = build_logger(args, config, train=True,run_time=meta.get("log_ts"))
 
     # Datasets and loaders
     train_loader, val_loader, test_loader, train_iterator = build_datasetLoader(config, logger)

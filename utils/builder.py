@@ -10,6 +10,7 @@ import logging
 from torch.utils.data import random_split
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch.utils.tensorboard import SummaryWriter
+from typing import Optional, Tuple, Dict, Any
 
 from preprocess import get_pcqm4m_dataset
 from .data import CollateWithSPDLmdb, CollateWithSPDEdgeLmdb
@@ -18,48 +19,169 @@ from .ZINC_preprocess import Zinc20_3D_LMDBDataset
 from models import GraphGPSEncoder, GraphGPSEncoder_CLS, GraphGPSEncoder_CLS_GraphormerSPD, GraphGPSEncoder_CLS_PEARL   
 from models import GraphGPSEncoder_CLS_GraphormerSPD_Pearl
 from models import MolPosDiffusion, MolPosDiffusion_condition, MolPosDiffusion_cat
-    
-def build_logger(args, config, train: bool = True):
-    """
-    train=True  -> train diffusion logs + ckpt dir
-    train=False -> eval diffusion logs (no resume semantics)
-    """
+
+
+def _build_tag(config) -> str:
     tag = f"en{config.encoder.num_layers}_de{config.model.num_layers}_e_{config.encoder.name}_d_{config.model.model_type}"
     if config.encoder.name in ['cls_pearl', 'cls_graphormer_pearl']:
         tag = tag + f"_{config.encoder.pearl_fuse}"
+    return tag
 
-    run_time = time.localtime()
-    log_ts = time.strftime('%Y_%m_%d__%H_%M_%S', run_time)  # for log dir
+def _parse_run_time(run_time: Optional[object]) -> time.struct_time:
+    """
+    run_time 支持：
+    - None：使用当前时间 time.localtime()
+    - time.struct_time：直接用
+    - str：支持两种格式：
+        1) 'YYYYmmdd-HHMMSS'      (ckpt_ts)
+        2) 'YYYY_mm_dd__HH_MM_SS' (log_ts)
+    """
+    if run_time is None:
+        return time.localtime()
 
+    if isinstance(run_time, time.struct_time):
+        return run_time
+
+    if isinstance(run_time, str):
+        s = run_time.strip()
+        # ckpt_ts: 20260227-123045
+        try:
+            return time.strptime(s, "%Y%m%d-%H%M%S")
+        except Exception:
+            pass
+        # log_ts: 2026_02_27__12_30_45
+        try:
+            return time.strptime(s, "%Y_%m_%d__%H_%M_%S")
+        except Exception:
+            pass
+        raise ValueError(
+            f"Unrecognized run_time str format: {run_time}. "
+            f"Expect '%Y%m%d-%H%M%S' or '%Y_%m_%d__%H_%M_%S'."
+        )
+
+    raise TypeError(f"run_time must be None / time.struct_time / str, got {type(run_time)}")
+
+
+def build_ckpt(
+    args,
+    config,
+    *,
+    train: bool = True,
+    run_time: Optional[object] = None,
+    create_dir: bool = True,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    返回：
+      ckpt_dir: str
+      meta: dict，包含 tag / config_name / ckpt_ts / log_ts（方便 downstream 复用）
+
+    说明：
+    - 训练 fresh：用 run_time（或当前时间）生成 ckpt_ts
+    - resume：忽略 run_time，直接从 resume_ckpt 推导 ckpt_dir
+    - downstream/eval：可以传 create_dir=False，避免误创建新目录
+    """
+    tag = _build_tag(config)
+
+    # ===== train branch =====
     if train:
         if getattr(args, "resume", False):
-            if args.resume_log_dir is None or args.resume_ckpt is None:
-                raise ValueError("When --resume, you must provide --resume_log_dir and --resume_ckpt")
-
-            log_dir = args.resume_log_dir
+            if args.resume_ckpt is None:
+                raise ValueError("When --resume, you must provide --resume_ckpt")
             ckpt_path = resolve_ckpt_path(args.resume_ckpt)
             ckpt_dir = os.path.dirname(ckpt_path) if os.path.isfile(ckpt_path) else args.resume_ckpt
-            os.makedirs(log_dir, exist_ok=True)
+            if create_dir:
+                os.makedirs(ckpt_dir, exist_ok=True)
+            meta = {
+                "tag": tag,
+                "mode": "resume",
+                "ckpt_path": ckpt_path,
+                "ckpt_dir": ckpt_dir,
+                "ckpt_ts": None,
+                "log_ts": None,
+            }
+            return ckpt_dir, meta
+
+        # fresh training
+        run_tm = _parse_run_time(run_time)
+        ckpt_ts = time.strftime('%Y%m%d-%H%M%S', run_tm)         # for ckpt dir
+        log_ts  = time.strftime('%Y_%m_%d__%H_%M_%S', run_tm)    # optional (for pairing)
+
+        config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
+        ckpt_dir = os.path.join('outputs', 'checkpoints', config_name, f"{tag}_{ckpt_ts}")
+
+        if create_dir:
             os.makedirs(ckpt_dir, exist_ok=True)
+
+        meta = {
+            "tag": tag,
+            "mode": "fresh",
+            "config_name": config_name,
+            "ckpt_ts": ckpt_ts,
+            "log_ts": log_ts,
+        }
+        return ckpt_dir, meta
+
+    # ===== eval branch =====
+    # 通常 eval 不“创建 ckpt_dir”，而是读取现有 ckpt_path；这里给一个可选的推导能力
+    run_tm = _parse_run_time(run_time)
+    ckpt_ts = time.strftime('%Y%m%d-%H%M%S', run_tm)
+    log_ts  = time.strftime('%Y_%m_%d__%H_%M_%S', run_tm)
+
+    config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
+    ckpt_dir = os.path.join('outputs', 'checkpoints', config_name, f"{tag}_{ckpt_ts}")
+
+    meta = {
+        "tag": tag,
+        "mode": "eval_infer",
+        "config_name": config_name,
+        "ckpt_ts": ckpt_ts,
+        "log_ts": log_ts,
+    }
+    # eval 默认不建目录，除非你真的要写东西进去
+    if create_dir:
+        os.makedirs(ckpt_dir, exist_ok=True)
+    return ckpt_dir, meta
+
+
+def build_logger(
+    args,
+    config,
+    *,
+    train: bool = True,
+    run_time: Optional[object] = None,
+    resume: Optional[bool] = None,
+) -> Tuple[object, object, str]:
+    """
+    返回：
+      logger, writer, log_dir
+    """
+    tag = _build_tag(config)
+
+    if resume is None:
+        resume = bool(getattr(args, "resume", False))
+
+    run_tm = _parse_run_time(run_time)
+    log_ts = time.strftime('%Y_%m_%d__%H_%M_%S', run_tm)
+
+    if train:
+        if resume:
+            if args.resume_log_dir is None:
+                raise ValueError("When --resume, you must provide --resume_log_dir")
+            log_dir = args.resume_log_dir
+            os.makedirs(log_dir, exist_ok=True)
 
             logger = setup_logger(log_dir, resume=True, name='train')
             writer = SummaryWriter(log_dir)
 
             logger.info(args)
             logger.info(config)
-            logger.info(f"[RESUME] ckpt_path={ckpt_path}")
-            logger.info(f"[RESUME] ckpt_dir={ckpt_dir}")
+            logger.info(f"[RESUME] log_dir={log_dir}")
 
-            return logger, writer, log_dir, ckpt_dir
+            return logger, writer, log_dir
 
         # fresh training
-        config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
-        ckpt_ts = time.strftime('%Y%m%d-%H%M%S', run_time)   # for ckpt dir
-
         log_dir = os.path.join('logs_diffusion', f"{log_ts}_{tag}")
-        ckpt_dir = os.path.join('outputs', 'checkpoints', config_name, f"{tag}_{ckpt_ts}")
         os.makedirs(log_dir, exist_ok=True)
-        os.makedirs(ckpt_dir, exist_ok=True)
 
         logger = setup_logger(log_dir, resume=False, name='train')
         writer = SummaryWriter(log_dir)
@@ -67,7 +189,6 @@ def build_logger(args, config, train: bool = True):
         logger.info(args)
         logger.info(config)
         logger.info(f"[TRAIN] log_dir={log_dir}")
-        logger.info(f"[TRAIN] ckpt_dir={ckpt_dir}")
 
         # snapshot code/config (best-effort)
         try:
@@ -80,7 +201,7 @@ def build_logger(args, config, train: bool = True):
         except Exception as e:
             logger.warning(f"Failed to copy models dir: {e}")
 
-        return logger, writer, log_dir, ckpt_dir
+        return logger, writer, log_dir
 
     # ===== evaluation branch =====
     log_dir = os.path.join('logs_diffusion_evaluation', f"{log_ts}_{tag}")
@@ -93,7 +214,82 @@ def build_logger(args, config, train: bool = True):
     logger.info(config)
     logger.info(f"[EVAL] log_dir={log_dir}")
 
-    return logger, writer, log_dir
+    return logger, writer, log_dir  
+# def build_logger(args, config, train: bool = True):
+#     """
+#     train=True  -> train diffusion logs + ckpt dir
+#     train=False -> eval diffusion logs (no resume semantics)
+#     """
+#     tag = f"en{config.encoder.num_layers}_de{config.model.num_layers}_e_{config.encoder.name}_d_{config.model.model_type}"
+#     if config.encoder.name in ['cls_pearl', 'cls_graphormer_pearl']:
+#         tag = tag + f"_{config.encoder.pearl_fuse}"
+
+#     run_time = time.localtime()
+#     log_ts = time.strftime('%Y_%m_%d__%H_%M_%S', run_time)  # for log dir
+
+#     if train:
+#         if getattr(args, "resume", False):
+#             if args.resume_log_dir is None or args.resume_ckpt is None:
+#                 raise ValueError("When --resume, you must provide --resume_log_dir and --resume_ckpt")
+
+#             log_dir = args.resume_log_dir
+#             ckpt_path = resolve_ckpt_path(args.resume_ckpt)
+#             ckpt_dir = os.path.dirname(ckpt_path) if os.path.isfile(ckpt_path) else args.resume_ckpt
+#             os.makedirs(log_dir, exist_ok=True)
+#             os.makedirs(ckpt_dir, exist_ok=True)
+
+#             logger = setup_logger(log_dir, resume=True, name='train')
+#             writer = SummaryWriter(log_dir)
+
+#             logger.info(args)
+#             logger.info(config)
+#             logger.info(f"[RESUME] ckpt_path={ckpt_path}")
+#             logger.info(f"[RESUME] ckpt_dir={ckpt_dir}")
+
+#             return logger, writer, log_dir, ckpt_dir
+
+#         # fresh training
+#         config_name = os.path.basename(args.config)[:os.path.basename(args.config).rfind('.')]
+#         ckpt_ts = time.strftime('%Y%m%d-%H%M%S', run_time)   # for ckpt dir
+
+#         log_dir = os.path.join('logs_diffusion', f"{log_ts}_{tag}")
+#         ckpt_dir = os.path.join('outputs', 'checkpoints', config_name, f"{tag}_{ckpt_ts}")
+#         os.makedirs(log_dir, exist_ok=True)
+#         os.makedirs(ckpt_dir, exist_ok=True)
+
+#         logger = setup_logger(log_dir, resume=False, name='train')
+#         writer = SummaryWriter(log_dir)
+
+#         logger.info(args)
+#         logger.info(config)
+#         logger.info(f"[TRAIN] log_dir={log_dir}")
+#         logger.info(f"[TRAIN] ckpt_dir={ckpt_dir}")
+
+#         # snapshot code/config (best-effort)
+#         try:
+#             shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
+#         except Exception as e:
+#             logger.warning(f"Failed to copy config file: {e}")
+
+#         try:
+#             shutil.copytree('./models', os.path.join(log_dir, 'models'), dirs_exist_ok=True)
+#         except Exception as e:
+#             logger.warning(f"Failed to copy models dir: {e}")
+
+#         return logger, writer, log_dir, ckpt_dir
+
+#     # ===== evaluation branch =====
+#     log_dir = os.path.join('logs_diffusion_evaluation', f"{log_ts}_{tag}")
+#     os.makedirs(log_dir, exist_ok=True)
+
+#     logger = setup_logger(log_dir, resume=False, name='evaluate')
+#     writer = SummaryWriter(log_dir)
+
+#     logger.info(args)
+#     logger.info(config)
+#     logger.info(f"[EVAL] log_dir={log_dir}")
+
+#     return logger, writer, log_dir
   
 
 def build_datasetLoader(config, logger, test_scale = None):

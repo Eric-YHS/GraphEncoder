@@ -599,6 +599,7 @@ class GraphGlobalSelfAttention_CLS_Graphormer(nn.Module):
             )
         if spatial_pos.dtype != torch.long:
             spatial_pos = spatial_pos.long()
+        assert edge_input.size(-1) == self.spd_max_dist
 
         ########### [CLS; nodes]
         cls_tok = cls.unsqueeze(1)                    # [B,1,D]
@@ -940,8 +941,14 @@ class PearlAbsolutePE(nn.Module):
     def _sample_q(self, N: int, device, dtype):
         if (not self.training) and self.deterministic_eval:
             # 局部固定 seed，不污染外部 RNG
-            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+            devs = []
+            if device.type == "cuda":
+                devs = [device.index] if device.index is not None else list(range(torch.cuda.device_count()))
+            with torch.random.fork_rng(devices=devs):
                 torch.manual_seed(0)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(0)
+
                 q = torch.randn(self.num_samples, N, self.q_dim, device=device, dtype=dtype)
         else:
             q = torch.randn(self.num_samples, N, self.q_dim, device=device, dtype=dtype)
