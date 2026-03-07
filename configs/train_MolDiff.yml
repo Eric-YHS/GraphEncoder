@@ -1,0 +1,103 @@
+model:
+  model_type: MolDiff
+  num_layers: 6
+  name: diffusion
+  node_dim: 256
+  edge_dim: 64
+  denoiser:
+    backbone: NodeEdgeNet
+    num_blocks: 6
+    cutoff: 15
+    use_gate: True
+  diff:
+    num_timesteps: 1000
+    time_dim: 10
+    categorical_space: discrete
+    diff_pos:
+      beta_schedule: advance
+      scale_start: 0.9999
+      scale_end: 0.0001
+      width: 3
+    diff_atom: 
+      init_prob: tomask
+      beta_schedule: advance
+      scale_start: 0.9999
+      scale_end: 0.0001
+      width: 3
+    diff_bond:
+      init_prob: absorb
+      beta_schedule: segment
+      time_segment: [600, 400]
+      segment_diff: 
+        - scale_start: 0.9999
+          scale_end: 0.001
+          width: 3
+        - scale_start: 0.001
+          scale_end: 0.0001
+          width: 2
+
+
+train:
+  seed: 2023
+  batch_size: 256
+  n_acc_batch: 8
+  num_workers: 64
+  pin_memory: True
+  max_iters: 60000
+  val_freq: 375
+  pos_noise_std: 0.05
+  max_grad_norm: 50.0
+  use_amp: True
+  cond_dropout: 
+    p_uncond: 0.1
+    p_drop_node: 0.1
+    p_drop_graph: 0.1
+  optimizer:
+    type: adamw
+    lr: 1.e-4
+    weight_decay: 1.e-8
+    beta1: 0.99
+    beta2: 0.999
+  scheduler:
+    type: plateau
+    factor: 0.8
+    patience: 1000
+    min_lr: 1.e-5
+
+transform:
+  use_mask_node: True
+  use_mask_edge: True
+
+chem:
+  atomic_numbers: [6,7,8,9,15,16,17]  # C N O F P S Cl
+  mol_bond_types: [1, 2, 3, 4]  # single, double, triple, aromatic
+
+data:
+  name: PCQM4M # ZINC/PCQM4M
+  path: /mnt2/luyifeng/diff4MoleculeRepresentation/data/PCQM4M
+  # path: ./data/PCQM4M
+  # path: /mnt2/luyifeng/ZINC/zinc20_3d_6000000_k1/zinc_confs.lmdb
+  node_in_dim: 9
+  edge_in_dim: 3
+  num_node_type: 35
+  num_edge_type: 4
+  
+encoder:
+  name: cls_graphormer_pearl # ['normal', 'cls', 'cls_graphormer', 'cls_pearl' 'cls_graphormer_pearl']
+  hidden_dim: 176
+  num_layers: 9
+  num_heads: 8
+  dropout: 0.1
+  attn_dropout: 0.0
+  edge_emb_dim: 64
+  use_degree: True
+  max_degree: 10
+  use_spd_bias: True
+  spd_max_dist: 8
+
+  pearl_q_dim: 16
+  pearl_num_samples: 8
+  pearl_num_layers: 4
+  pearl_dropout: 0.1
+  pearl_deterministic_eval: True
+  pearl_fuse: "concat"      # add/concat

@@ -1,3 +1,4 @@
+from tkinter import NO
 import numpy as np
 import torch
 import torch.nn as nn
@@ -36,7 +37,6 @@ class GraphCondEmbedder(nn.Module):
         self,
         graph_emb: torch.Tensor,      # [B, in_dim]
         batch: torch.Tensor,          # [N]  node->graph mapping
-        training: bool,
         unconditioned: bool = False,
     ) -> torch.Tensor:
         assert graph_emb.dim() == 2, "graph_embedding must be [num_graphs, graph_emb_dim]"
@@ -46,17 +46,21 @@ class GraphCondEmbedder(nn.Module):
         B = graph_emb.size(0)
         device = graph_emb.device
 
+        if batch.numel() > 0:
+            assert batch.min().item() >= 0, "batch has negative graph indices"
+            assert batch.max().item() < B, f"batch contains index >= B (B={B})"
+
         force_drop = torch.isnan(graph_emb).any(dim=-1)  # [B] bool
 
         if unconditioned:
             drop_mask = torch.ones(B, device=device, dtype=torch.bool)
         else:
             drop_mask = force_drop
-            if training and self.drop_prob > 0:
-                rand_drop = (torch.rand(B, device=device) < self.drop_prob)
-                drop_mask = drop_mask | rand_drop
+            if self.training and self.drop_prob > 0:
+                drop_mask = drop_mask | (torch.rand(B, device=device) < self.drop_prob)
 
-        emb = self.proj(graph_emb)  # [B, hidden_dim]
+        safe_graph_emb = graph_emb.masked_fill(drop_mask.unsqueeze(-1), 0.0)
+        emb = self.proj(safe_graph_emb)  # [B, hidden_dim]
         null = self.null.unsqueeze(0).expand(B, -1)  # [B, hidden_dim]
         emb = torch.where(drop_mask.unsqueeze(-1), null, emb)  # drop -> null
 
@@ -255,6 +259,15 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
 
         self.distance_expansion = GaussianSmearing(self.r_min, self.r_max, num_gaussians=num_r_gaussian)
 
+        # condition
+        self.cond_dim = hidden_dim
+        self.norm_h = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.adaLN_modulation = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 3 * hidden_dim, bias=True),  # shift, scale, gate (all [N, D])
+        )
+
         self.x2h_layers = nn.ModuleList()
         for i in range(self.num_x2h):
             self.x2h_layers.append(
@@ -283,16 +296,23 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
         else:
             edge_feat = None
 
+        if cond_node is None:
+            h_mod = h
+            gate = None
+        else:
+            shift, scale, gate = self.adaLN_modulation(cond_node).chunk(3, dim=-1)
+            h_mod = modulate(self.norm_h(h), shift, scale)  # [N, D]
+
         rel_x = x[dst] - x[src]
         dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
 
-        h_in = h
+        h_in = h_mod
         base_dist_feat = self.distance_expansion(dist)
         base_dist_feat = outer_product(edge_type_feat, base_dist_feat)
 
         for i in range(self.num_x2h):
             h_out = self.x2h_layers[i](
-                h_in, base_dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=cond_node
+                h_in, base_dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=None
             )
             h_in = h_out
         x2h_out = h_in
@@ -303,13 +323,17 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             dist_feat = outer_product(edge_type_feat, dist_feat)
 
             delta_x = self.h2x_layers[i](
-                new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=cond_node
+                new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=None
             )
             if not fix_x:
                 x = x + delta_x * mask_ligand[:, None]
 
             rel_x = x[dst] - x[src]
             dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
+        
+        if gate is not None:
+            x2h_out = x2h_out + gate
+
 
         return x2h_out, x
 
@@ -409,7 +433,7 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
             cond_node = self.graph_cond_embedder(
                 graph_emb=graph_embedding,
                 batch=batch,
-                training=self.training,
+                # training=self.training,
                 unconditioned=unconditioned
             )  # [N, hidden_dim]
 

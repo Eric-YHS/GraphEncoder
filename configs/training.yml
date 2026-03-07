@@ -59,8 +59,9 @@ model:
   r_max: 5          # 1.5/ 5 /10
   x2h_out_fc: False
   sync_twoup: False
-  node_dropout: 0.1 # dropout node-wise embedding
+  node_dropout: 0.2 # dropout node-wise embedding
   node_dropout_type: "node" # node/feature/both
+  graph_dropout: 0.2
 
 train:
   seed: 0

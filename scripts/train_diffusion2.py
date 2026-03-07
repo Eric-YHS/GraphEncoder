@@ -26,6 +26,8 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 
+from models import MolDiff
+
 def within_graph_shuffle(node_emb, batch_id):
     node_s = node_emb.clone()
     B = int(batch_id.max().item()) + 1
@@ -124,21 +126,24 @@ def evaluate(encoder, diffusion, loader, device, config) -> float:
     diffusion.eval()
 
     losses = []
+    losses_pos = []
+    losses_node = []
+    losses_edge = []
     with torch.no_grad():
         for b in loader:
             b = _to_device_and_cast(b, device)
             enc_out = forward_encoder(encoder, b)
             node_emb, graph_emb = enc_out
 
-            if config.model.model_type in ['uni_o2_condition', 'uni_o2_cat']:
-                out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None, graph_emb=graph_emb)
-            else:
-                out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None)
-            losses.append(out["loss"].item())
+            loss_dict = diffusion.get_loss(b, node_cond=node_emb, graph_cond=graph_emb)
+            losses.append(loss_dict["loss"].item())
+            losses_pos.append(loss_dict["loss_pos"].item())
+            losses_node.append(loss_dict["loss_node"].item())
+            losses_edge.append(loss_dict["loss_edge"].item())
 
     encoder.train()
     diffusion.train()
-    return float(sum(losses) / max(1, len(losses)))
+    return float(sum(losses) / max(1, len(losses))), float(sum(losses_pos) / max(1, len(losses_pos))), float(sum(losses_node) / max(1, len(losses_node))), float(sum(losses_edge) / max(1, len(losses_edge)))
 
 
 def save_ckpt(path, step, encoder, diffusion, optimizer, scheduler, best_val):
@@ -196,8 +201,8 @@ def find_log_file_to_append(log_dir: str) -> str:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./configs/training.yml')
-    parser.add_argument('--device', type=str, default='cuda:1')
+    parser.add_argument('--config', type=str, default='./configs/train_MolDiff.yml')
+    parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--logdir', type=str, default='./logs_diffusion')
     parser.add_argument('--train_report_iter', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='GraphGPS_Encoder')
@@ -249,7 +254,7 @@ if __name__ == '__main__':
     # Encoder
     encoder = build_encoder(config, device)
     # Diffusion (pos-only)
-    diffusion = build_diffusion(config, device)
+    diffusion = MolDiff(config).to(device)
     # Optimizer and scheduler
     params = list(encoder.parameters()) + list(diffusion.parameters())
     opt_cfg = config.train.optimizer
@@ -321,40 +326,15 @@ if __name__ == '__main__':
             optimizer.zero_grad(set_to_none=True)
 
             total_loss = 0.0
+            total_loss_pos = 0.0
+            total_loss_node = 0.0
+            total_loss_edge = 0.0
             for i in range(acc_steps):
                 b = next(train_iterator)
                 b = _to_device_and_cast(b, device)
 
-                # # 可删，检查数据
-                # if i == 0 and step == start_step:
-                #     has_spd = hasattr(b, "spatial_pos_dense") and (b.spatial_pos_dense is not None)
-                #     has_edge_input = hasattr(b, "edge_input_dense") and (b.edge_input_dense is not None)
-                #     logger.info(f"[data] has_spatial_pos_dense={has_spd} has_edge_input_dense={has_edge_input}")
-
-                #     if has_spd:
-                #         spd = b.spatial_pos_dense
-                #         logger.info(f"[data] spatial_pos_dense shape={tuple(spd.shape)} dtype={spd.dtype} min={int(spd.min())} max={int(spd.max())}")
-                #     if has_edge_input:
-                #         ei = b.edge_input_dense
-                #         logger.info(f"[data] edge_input_dense shape={tuple(ei.shape)} dtype={ei.dtype} min={int(ei.min())} max={int(ei.max())}")
-
                 enc_out = forward_encoder(encoder, b)
                 node_emb, graph_emb = enc_out
-
-
-                # if i == 0:
-                #     with torch.no_grad():
-                #         ge = graph_emb  # [B,D]
-                #         logger.info(f"[emb_stats step {step}] graph_emb std_mean={ge.std(dim=0).mean().item():.3e} "
-                #                     f"norm_mean={ge.norm(dim=-1).mean().item():.3e}")
-
-                #         # 看随机 64 个图的平均余弦相似度（越接近 1 越塌缩）
-                #         import torch.nn.functional as F
-                #         idx = torch.randperm(ge.size(0), device=ge.device)[:64]
-                #         g = F.normalize(ge[idx], dim=-1)
-                #         sim = (g @ g.t())
-                #         mean_offdiag = (sim.sum() - sim.diag().sum()) / (sim.numel() - sim.size(0))
-                #         logger.info(f"[emb_stats step {step}] graph_emb mean_cos_offdiag={mean_offdiag.item():.4f}")
 
                 # 可删，检查 diffusion 对 encoder 的依赖
                 if i == 0 and (step == start_step or step % 200 == 0):
@@ -387,28 +367,28 @@ if __name__ == '__main__':
                             # 注意：你用的是哪种 diffusion，就按需传 graph_emb
                             def loss_normal():
                                 if graph_emb_p is not None:
-                                    return diffusion.get_diffusion_loss(b, cond_node_emb=node_emb_p, graph_emb=graph_emb_p, time_step=t)
-                                return diffusion.get_diffusion_loss(b, cond_node_emb=node_emb_p, time_step=t)
+                                    return diffusion.get_loss(b, node_cond=node_emb_p, graph_cond=graph_emb_p)
+                                return diffusion.get_loss(b, node_cond=node_emb_p)
 
                             def loss_zero_node():
                                 if graph_emb_p is not None:
-                                    return diffusion.get_diffusion_loss(b, cond_node_emb=node0, graph_emb=graph_emb_p, time_step=t)
-                                return diffusion.get_diffusion_loss(b, cond_node_emb=node0, time_step=t)
+                                    return diffusion.get_loss(b, node_cond=node0, graph_cond=graph_emb_p)
+                                return diffusion.get_loss(b, node_cond=node0)
 
                             def loss_zero_graph():
                                 if graph_emb_p is not None:
-                                    return diffusion.get_diffusion_loss(b, cond_node_emb=node_emb_p, graph_emb=graph0, time_step=t)
-                                return diffusion.get_diffusion_loss(b, cond_node_emb=node_emb_p, time_step=t)
+                                    return diffusion.get_loss(b, node_cond=node_emb_p, graph_cond=graph0)
+                                return diffusion.get_loss(b, node_cond=node_emb_p)
 
                             def loss_shuffle_node():
                                 if graph_emb_p is not None:
-                                    return diffusion.get_diffusion_loss(b, cond_node_emb=node_shuf, graph_emb=graph_emb_p, time_step=t)
-                                return diffusion.get_diffusion_loss(b, cond_node_emb=node_shuf, time_step=t)
+                                    return diffusion.get_loss(b, node_cond=node_shuf, graph_cond=graph_emb_p)
+                                return diffusion.get_loss(b, node_cond=node_shuf)
 
                             def loss_shuffle_graph():
                                 if graph_emb_p is not None:
-                                    return diffusion.get_diffusion_loss(b, cond_node_emb=node_emb_p, graph_emb=graph_shuf, time_step=t)
-                                return diffusion.get_diffusion_loss(b, cond_node_emb=node_emb_p, time_step=t)
+                                    return diffusion.get_loss(b, node_cond=node_emb_p, graph_cond=graph_shuf)
+                                return diffusion.get_loss(b, node_cond=node_emb_p, time_step=t)
 
                             seed = 1234  # 固定 eps
                             ln  = fixed_rng_loss(loss_normal, seed, device)
@@ -425,74 +405,19 @@ if __name__ == '__main__':
 
                     encoder.train(); diffusion.train()
 
-                # if i == 0 and step == start_step:
-                #     node_emb1, graph_emb1 = enc_out
+                loss_dict = diffusion.get_loss(b, node_cond=node_emb, graph_cond=graph_emb)
 
-                #     # 1) SPD ablation: 把 spatial_pos_dense 全置成最大/0，看输出变化
-                #     if hasattr(b, "spatial_pos_dense") and b.spatial_pos_dense is not None:
-                #         b2 = b.clone()  # 浅拷贝够用（注意：如果你会改 tensor，最好 clone）
-                #         b2.spatial_pos_dense = torch.zeros_like(b.spatial_pos_dense)
-                #         node_emb2, graph_emb2 = forward_encoder(encoder, b2)
-
-                #         d_graph = (graph_emb1 - graph_emb2).norm(dim=-1).mean().item()
-                #         logger.info(f"[sanity] graph_emb delta after zero SPD: {d_graph:.4e}")
-
-                #     # 2) edge_input ablation（GraphormerSPD 用到）：置零
-                #     if hasattr(b, "edge_input_dense") and b.edge_input_dense is not None:
-                #         b3 = b.clone()
-                #         b3.edge_input_dense = torch.zeros_like(b.edge_input_dense)
-                #         node_emb3, graph_emb3 = forward_encoder(encoder, b3)
-
-                #         d_graph = (graph_emb1 - graph_emb3).norm(dim=-1).mean().item()
-                #         logger.info(f"[sanity] graph_emb delta after zero edge_input: {d_graph:.4e}")
-
-
-                # bond_edge_attr_backup = getattr(b, "edge_attr", None)
-                # b.edge_attr = torch.zeros_like(bond_edge_attr_backup)
-                if config.model.model_type in ['uni_o2_condition', 'uni_o2_cat']:
-                    out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None, graph_emb=graph_emb)
-                else:
-                    out = diffusion.get_diffusion_loss(b, cond_node_emb=node_emb, time_step=None)
                 # b.edge_attr = bond_edge_attr_backup
-                loss = out["loss"] / acc_steps
+                loss = loss_dict["loss"] / acc_steps
                 loss.backward()
-                total_loss += float(out["loss"].item())
+                total_loss += float(loss_dict["loss"].item())
+                total_loss_pos += float(loss_dict["loss_pos"].item())
+                total_loss_node += float(loss_dict["loss_node"].item())
+                total_loss_edge += float(loss_dict["loss_edge"].item())
             total_loss /= acc_steps
-
-            # # after backward, before grad clip
-            # if step % args.train_report_iter == 0:
-            #     g_enc = grad_norm(encoder)
-            #     g_diff = grad_norm(diffusion)
-            #     logger.info(f"[step {step}] grad_norm enc={g_enc:.3e} diff={g_diff:.3e}")
-            #     writer.add_scalar("train/grad_norm_encoder", g_enc, step)
-            #     writer.add_scalar("train/grad_norm_diffusion", g_diff, step)
-
-            #     # optional: report if many encoder params have no grad
-            #     enc_no_grad = sum((p.grad is None) for p in encoder.parameters())
-            #     enc_total = sum(1 for _ in encoder.parameters())
-            #     dif_no_grad = sum((p.grad is None) for p in diffusion.parameters())
-            #     dif_total = sum(1 for _ in diffusion.parameters())
-            #     logger.info(f"[step {step}] encoder params w/o grad: {enc_no_grad}/{enc_total}")
-            #     logger.info(f"[step {step}] diffusion params w/o grad: {dif_no_grad}/{dif_total}")
-
-            # # 可删，检查 encoder 和 diffusion 的 no-grad 参数
-            # if step < 50:
-            #     no_grad_enc = [n for n,p in encoder.named_parameters() if p.grad is None]
-            #     no_grad_diff = [n for n,p in diffusion.named_parameters() if p.grad is None]
-            #     logger.info(f"[debug] encoder no-grad params: {no_grad_enc}")
-            #     logger.info(f"[debug] diffusion no-grad params: {no_grad_diff}")
-            # # 可删，检查 encoder 的 grad 和 weight
-            # if step % args.train_report_iter == 0:
-            #     watch = ["spatial_emb", "edge_path_emb", "graph_token_virtual_distance",
-            #             "graph_token", "pearl_scale", "pearl_fuse_proj"]
-            #     for name, p in encoder.named_parameters():
-            #         if any(k in name for k in watch):
-            #             g = 0.0 if p.grad is None else p.grad.data.norm().item()
-            #             w = p.data.norm().item()
-            #             writer.add_scalar(f"train/watch_grad/{name}", g, step)
-            #             writer.add_scalar(f"train/watch_weight/{name}", w, step)
-            #             # logger.info(f"train/watch_grad/{name}", g, step)
-            #             # logger.info(f"train/watch_weight/{name}", w, step)
+            total_loss_pos /= acc_steps
+            total_loss_node /= acc_steps
+            total_loss_edge /= acc_steps
 
             if max_grad_norm and max_grad_norm > 0:
                 nn.utils.clip_grad_norm_(params, max_grad_norm)
@@ -512,20 +437,26 @@ if __name__ == '__main__':
                 lr = optimizer.param_groups[0]["lr"]
                 dt = time.time() - t0
                 t0 = time.time()
-                logger.info(f"[step {step}] train_loss={total_loss:.6f} lr={lr:.2e} dt={dt:.2f}s")
+                logger.info(f"[step {step}] train_loss={total_loss:.6f} train_loss_pos={total_loss_pos:.6f} train_loss_node={total_loss_node:.6f} train_loss_edge={total_loss_edge:.6f} lr={lr:.2e} dt={dt:.2f}s")
                 writer.add_scalar("train/loss", total_loss, step)
+                writer.add_scalar("train/loss_pos", total_loss_pos, step)
+                writer.add_scalar("train/loss_node", total_loss_node, step)
+                writer.add_scalar("train/loss_edge", total_loss_edge, step)
                 writer.add_scalar("train/lr", lr, step)
 
             # validation
             if step % val_freq == 0:
-                val_loss = evaluate(encoder, diffusion, val_loader, device, config)
-                logger.info(f"[step {step}] val_loss={val_loss:.6f}")
+                val_loss, val_loss_pos, val_loss_node, val_loss_edge = evaluate(encoder, diffusion, val_loader, device, config)
+                logger.info(f"[step {step}] val_loss={val_loss:.6f} val_loss_pos={val_loss_pos:.6f} val_loss_node={val_loss_node:.6f} val_loss_edge={val_loss_edge:.6f}")
                 writer.add_scalar("val/loss", val_loss, step)
+                writer.add_scalar("val/loss_pos", val_loss_pos, step)
+                writer.add_scalar("val/loss_node", val_loss_node, step)
+                writer.add_scalar("val/loss_edge", val_loss_edge, step)
 
                 if scheduler is not None:
                     scheduler.step(val_loss)
 
-                print(f"epoch {step} | train_loss: {total_loss:.6f} | val_loss: {val_loss:.6f}")
+                print(f"epoch {step} | train_loss: {total_loss:.6f} | val_loss: {val_loss:.6f} | val_loss_pos: {val_loss_pos:.6f} | val_loss_node: {val_loss_node:.6f} | val_loss_edge: {val_loss_edge:.6f}")
 
                 # save best
                 if val_loss < best_val:

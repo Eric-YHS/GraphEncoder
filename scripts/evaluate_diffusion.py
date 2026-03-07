@@ -20,7 +20,7 @@ from collections import deque
 import torch
 
 from utils.covmat import pairwise_rmsd_matrix, covmat_from_rmsd, aggregate_covmat, CovMatResult
-from utils.builder import build_datasetLoader,build_diffusion,build_encoder, build_logger
+from utils.builder import build_datasetLoader,build_diffusion,build_encoder, build_logger, build_ckpt
 
 def _gpu_mem_gb(device):
     if device.type != "cuda":
@@ -60,7 +60,6 @@ def split_pos_by_graph(batch: Batch, pos: torch.Tensor) -> List[np.ndarray]:
         out.append(pos_np[s:e])
     return out
 
-@torch.no_grad()
 @torch.no_grad()
 def generate_positions_for_batch(
     encoder: torch.nn.Module,
@@ -127,16 +126,16 @@ def evaluate_covmat(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt_root", type=str, default="outputs/checkpoints/training")
-    ap.add_argument("--ckpt_date", type=str, default="20260127-143109")
+    ap.add_argument("--ckpt_date", type=str, default="20260302-154952")
     ap.add_argument("--encoder_layers", type=int, default=9)
     ap.add_argument("--model_layers", type=int, default=5)
-    ap.add_argument("--encoder_name", type=str, default="cls_graphormer")
+    ap.add_argument("--encoder_name", type=str, default="cls_graphormer_pearl")
     ap.add_argument("--denoiser_name", type=str, default="uni_o2_condition")
 
     ap.add_argument("--device", type=str, default="cuda:0")
     ap.add_argument("--n_samples", type=int, default=2)  # GeoDiff 系通常 Sg=2*Sr；你这 Sr=1 -> 2
     ap.add_argument("--threshold", type=float, default=0.5)
-    ap.add_argument("--mode", type=str, choices=["sample", "reconstruct"], default="sample")
+    ap.add_argument("--mode", type=str, choices=["sample", "reconstruct"], default="reconstruct")
     ap.add_argument("--t_recon", type=int, default=None)
 
     ap.add_argument("--out_json", type=str, default="eval_covmat.json")
@@ -144,21 +143,21 @@ def main():
     ap.add_argument("--num_workers", type=int, default=0)
 
     # 数据集/配置：按你工程现有方式补齐
-    ap.add_argument("--train_config", type=str, default="configs/training.yml")
+    ap.add_argument("--config", type=str, default="configs/training.yml")
     ap.add_argument("--split", type=str, default="test")
+    ap.add_argument("--pearl_fuse", type=str, default=None)
 
     args = ap.parse_args()
     
     # config
-    config = misc.load_config(args.train_config)
+    config = misc.load_config(args.config)
     misc.seed_all(config.train.seed)
 
     device = torch.device(args.device)
     config = misc.update_config_with_args(config, args)
-    ckpt_path = ckpt_path_from_tag(
-        args.ckpt_root, args.encoder_layers, args.model_layers,
-        args.encoder_name, args.denoiser_name, args.ckpt_date
-    )
+    config.train.batch_size = args.batch_size
+    ckpt_path, meta = build_ckpt(args, config, train=False, run_time = args.ckpt_date)
+    ckpt_path = os.path.join(ckpt_path, "best.pt")
 
     # logger
     logger, writer, log_dir = build_logger(args, config, train=False)
@@ -226,13 +225,11 @@ def main():
             # 在线聚合一下当前结果，便于观察是否在“跑着但没产出”
             cur = aggregate_covmat(all_per_mol)
 
-            msg = (f"[eval] batch={bi+1}/{len(loader)} "
-                f"mols={n_seen} (+{batch.num_graphs}) "
-                f"avg_batch_time={sum(batch_times)/len(batch_times):.2f}s "
-                f"COV-R={cur.get('COV-R', float('nan')):.4f} "
-                f"MAT-R={cur.get('MAT-R', float('nan')):.4f} "
-                f"COV-P={cur.get('COV-P', float('nan')):.4f} "
-                f"MAT-P={cur.get('MAT-P', float('nan')):.4f}")
+            msg = (
+            f"... "
+            f"COV-R_mean={cur['COV-R_mean']:.4f} MAT-R_mean={cur['MAT-R_mean']:.4f} "
+            f"COV-P_mean={cur['COV-P_mean']:.4f} MAT-P_mean={cur['MAT-P_mean']:.4f}"
+            )
 
             if device.type == "cuda":
                 alloc, reserv = _gpu_mem_gb(device)
@@ -260,10 +257,10 @@ def main():
         "n_molecules": len(all_per_mol),
     }
 
-    with open(args.out_json, "w", encoding="utf-8") as f:
+    with open(out_json, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"[DONE] saved: {args.out_json}")
+    logger.info(f"[DONE] saved: {out_json}")
     logger.info(f"{final}")
 
 if __name__ == "__main__":

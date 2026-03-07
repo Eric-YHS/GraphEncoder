@@ -52,6 +52,7 @@ def get_refine_net(refine_net_type, config):
             x2h_out_fc=config.x2h_out_fc,
             sync_twoup=config.sync_twoup,
             graph_cond_dim = config.graph_emb_dim,
+            drop_graph_cond = config.graph_dropout,
         )
     elif refine_net_type == 'egnn':
         refine_net = EGNN(
@@ -407,6 +408,7 @@ class MolPosDiffusion(nn.Module):
             fix_x=False
         )
         pred = out['x']  # [N,3]
+        pred, _ = center_pos_mol(pred, batch_id, mode=self.center_pos_mode)
 
         if self.model_mean_type == 'C0':
             target = pos0
@@ -854,6 +856,7 @@ class MolPosDiffusion_condition(nn.Module):
         x = batch.x
         bond_edge_index = batch.edge_index
         bond_edge_attr = batch.edge_attr.float() if getattr(batch, "edge_attr", None) is not None else None
+        
 
         batch_id = batch.batch
 
@@ -881,6 +884,7 @@ class MolPosDiffusion_condition(nn.Module):
             unconditioned=False,
         )
         pred = out['x']  # [N,3]
+        pred, _ = center_pos_mol(pred, batch_id, mode=self.center_pos_mode)
 
         if self.model_mean_type == 'C0':
             target = pos0
@@ -967,10 +971,10 @@ class MolPosDiffusion_condition(nn.Module):
         model_out = out["x"]  # interpret according to model_mean_type
 
         x0_pred = self._model_pred_to_x0(x_t, model_out, t, batch_id)
+        x0_pred, _ = center_pos_mol(x0_pred, batch_id, mode=self.center_pos_mode)
 
         if clip_x0:
             x0_pred = x0_pred.clamp(min=-20.0, max=20.0)
-        x0_pred, _ = center_pos_mol(x0_pred, batch_id, mode=self.center_pos_mode)
 
         mean = self.q_pos_posterior_mean(x0_pred, x_t, t, batch_id)
         logvar = extract(self.posterior_logvar, t, batch_id)  # [N,1]
@@ -989,6 +993,7 @@ class MolPosDiffusion_condition(nn.Module):
             # z = self._com_free_noise_like(x_t, batch_id)
             z = torch.randn_like(x_t)
             x_prev = mean + torch.exp(0.5 * logvar) * z
+        
 
         return x_prev, x0_pred
 
@@ -1019,7 +1024,7 @@ class MolPosDiffusion_condition(nn.Module):
             )
             if return_traj:
                 traj.append(x_t.detach().cpu())
-
+        x_t, _ = center_pos_mol(x_t, batch_obj.batch, mode=self.center_pos_mode)
         return (x_t, traj) if return_traj else x_t
 
     @torch.no_grad()
@@ -1323,6 +1328,7 @@ class MolPosDiffusion_cat(nn.Module):
             fix_x=False
         )
         pred = out['x']  # [N,3]
+        pred, _ = center_pos_mol(pred, batch_id, mode=self.center_pos_mode)
 
         if self.model_mean_type == 'C0':
             target = pos0

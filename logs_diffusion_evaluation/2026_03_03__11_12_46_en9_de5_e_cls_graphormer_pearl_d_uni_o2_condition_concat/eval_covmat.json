@@ -1,0 +1,24 @@
+{
+  "config": {
+    "enlayer": 9,
+    "delayer": 5,
+    "encoder_name": "cls_graphormer_pearl",
+    "denoiser_name": "uni_o2_condition",
+    "ckpt_date": "20260302-154952",
+    "n_samples": 2,
+    "threshold": 0.5,
+    "mode": "reconstruct",
+    "t_recon": null
+  },
+  "metrics": {
+    "COV-R_mean": 0.0065686581169846735,
+    "MAT-R_mean": 2.3681247466068065,
+    "COV-P_mean": 0.0032843290584923367,
+    "MAT-P_mean": 2.8982754050810664,
+    "COV-R_median": 0.0,
+    "MAT-R_median": 2.369409204561423,
+    "COV-P_median": 0.0,
+    "MAT-P_median": 2.8860743843482095
+  },
+  "n_molecules": 3197
+}

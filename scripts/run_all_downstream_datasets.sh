@@ -94,15 +94,16 @@ export PYTHONUNBUFFERED=1
 # CONFIGS
 # format: enlayer|delayer|encoder_name|denoiser_name|ckpt_date|pearl_fuse
 # -------------------------
+  # "9|5|cls_graphormer|uni_o2_condition|20260204-163653|concat"
+  # "9|5|cls_pearl|uni_o2_condition|20260204-175227|concat"
+  # "9|5|cls_pearl|uni_o2_condition|20260204-180020|add"
+  # "9|5|cls_graphormer_pearl|uni_o2_condition|20260204-181909|concat"
+  # "9|5|cls_graphormer|uni_o2_cat|20260207-095648|concat"
+  # "9|5|cls_pearl|uni_o2_cat|20260207-100118|add"
+  # "9|5|cls_pearl|uni_o2_cat|20260207-100118|concat"
+  # "9|5|cls_graphormer_pearl|uni_o2_cat|20260207-095648|concat"
 CONFIGS=(
-  "9|5|cls_graphormer|uni_o2_condition|20260204-163653|concat"
-  "9|5|cls_pearl|uni_o2_condition|20260204-175227|concat"
-  "9|5|cls_pearl|uni_o2_condition|20260204-180020|add"
-  "9|5|cls_graphormer_pearl|uni_o2_condition|20260204-181909|concat"
-  "9|5|cls_graphormer|uni_o2_cat|20260207-095648|concat"
-  "9|5|cls_pearl|uni_o2_cat|20260207-100118|add"
-  "9|5|cls_pearl|uni_o2_cat|20260207-100118|concat"
-  "9|5|cls_graphormer_pearl|uni_o2_cat|20260207-095648|concat"
+  "9|5|cls_graphormer_pearl|uni_o2_condition|20260301-121017|concat"
 )
 
 # -------------------------
