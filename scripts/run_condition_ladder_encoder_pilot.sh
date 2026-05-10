@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-cd /XYAIFS00/HDD_POOL/nsccgz_ywang/nsccgz_ywang_wzh/huangjh/encoder
+RUN_DIR=${RUN_DIR:-/XYAIFS00/HDD_POOL/nsccgz_ywang/nsccgz_ywang_wzh/huangjh/encoder_condition_ladder}
+cd "${RUN_DIR}"
 source /app/bin/proxy.sh >/dev/null 2>&1 || true
 source /XYAIFS00/HDD_POOL/nsccgz_ywang/nsccgz_ywang_wzh/anaconda3/etc/profile.d/conda.sh
 conda activate hjhencoder
@@ -15,8 +16,10 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 SOURCE=${1:-none}
 DATA_ROOT=${DATA_ROOT:-/tmp/hjhencoder/PCQM4M}
 MAX_ITERS=${MAX_ITERS:-5000}
+MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+MASTER_PORT=${MASTER_PORT:-29541}
 
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train_condition_ladder.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_addr="${MASTER_ADDR}" --master_port="${MASTER_PORT}" scripts/train_condition_ladder.py \
   --config configs/training_condition_ladder.yml \
   --condition_source "${SOURCE}" \
   --logdir logs_condition_ladder \

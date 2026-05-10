@@ -16,7 +16,9 @@ MAX_ITERS=${MAX_ITERS:-20}
 DATA_ROOT=${DATA_ROOT:-/mnt2/luyifeng/diff4MoleculeRepresentation/data/PCQM4M}
 
 NPROC=$(python -c "print(len('${GPUS}'.split(',')))")
-CUDA_VISIBLE_DEVICES=${GPUS} torchrun --nproc_per_node=${NPROC} scripts/train_condition_ladder.py \
+MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+MASTER_PORT=${MASTER_PORT:-29531}
+CUDA_VISIBLE_DEVICES=${GPUS} torchrun --nproc_per_node=${NPROC} --master_addr="${MASTER_ADDR}" --master_port="${MASTER_PORT}" scripts/train_condition_ladder.py \
   --config configs/training_condition_ladder.yml \
   --condition_source "${SOURCE}" \
   --logdir logs_condition_ladder_smoke \
