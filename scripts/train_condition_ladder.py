@@ -490,6 +490,11 @@ def train(args):
     fixed_t_values = list(getattr(cfg.train, "fixed_t", [100, 500, 900]))
     fallback_on_nan = bool(getattr(cfg.train, "amp_fallback_on_nan", True))
     fallback_steps = int(getattr(cfg.train, "amp_fallback_steps", 100))
+    last_report_time = time.time()
+    last_report_step = 0
+    interval_graph_count = 0.0
+    interval_data_time = 0.0
+    interval_step_time = 0.0
 
     for step in range(1, max_iters + 1):
         diffusion.train()
@@ -513,22 +518,37 @@ def train(args):
                 raise
         scheduler.step()
         step_time = time.time() - step_start
+        interval_graph_count += graph_count
+        interval_data_time += data_time
+        interval_step_time += step_time
 
         if step % report_iter == 0 or step == 1:
             reduced = {k: reduce_mean(v, device) for k, v in metrics.items()}
             total_graphs = reduce_sum(graph_count, device)
             total_data_time = reduce_mean(data_time, device)
             graphs_per_sec = total_graphs / max(step_time, 1e-6)
+            now = time.time()
+            interval_wall = now - last_report_time
+            interval_steps = max(1, step - last_report_step)
+            interval_graphs = reduce_sum(interval_graph_count, device)
+            interval_data = reduce_mean(interval_data_time, device)
+            interval_step = reduce_mean(interval_step_time, device)
+            interval_graphs_sec = interval_graphs / max(interval_wall, 1e-6)
             if is_rank0():
                 stats = graph_stats(last_graph_cond)
                 mem = torch.cuda.max_memory_allocated(device) / (1024 ** 3) if device.type == "cuda" else 0.0
                 logger.info(
-                    "step=%d loss=%.6f graphs_sec=%.1f data_time=%.3f step_time=%.3f amp=%s mem_gb=%.2f adapter_grad=%.4f cond_stats=%s",
+                    "step=%d loss=%.6f graphs_sec=%.1f interval_graphs_sec=%.1f interval_wall=%.3f interval_steps=%d data_time=%.3f interval_data_time=%.3f step_time=%.3f interval_step_time=%.3f amp=%s mem_gb=%.2f adapter_grad=%.4f cond_stats=%s",
                     step,
                     reduced["loss"],
                     graphs_per_sec,
+                    interval_graphs_sec,
+                    interval_wall,
+                    interval_steps,
                     total_data_time,
+                    interval_data,
                     step_time,
+                    interval_step,
                     use_amp,
                     mem,
                     reduced.get("adapter_grad_norm", 0.0),
@@ -536,6 +556,11 @@ def train(args):
                 )
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(device)
+            last_report_time = now
+            last_report_step = step
+            interval_graph_count = 0.0
+            interval_data_time = 0.0
+            interval_step_time = 0.0
 
         if step % probe_freq == 0 or step == 1:
             probes = condition_probes(diffusion, condition_system, last_batch, device, fixed_t_values)

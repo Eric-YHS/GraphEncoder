@@ -424,20 +424,19 @@ def get_pcqm4m_dataset(
     split_idx = pyg_dataset.get_idx_split()
 
     data_mdb = os.path.join(pos_lmdb_path, "data.mdb")
-    if sdf_path is not None:
-        if (not os.path.exists(data_mdb)) and build_3d_cache_if_missing:
-            _build_or_update_3d_lmdb(
-                root=root,
-                sdf_path=sdf_path,
-                lmdb_path=pos_lmdb_path,
-                mapping_mode=mapping_mode,
-                use_chirality=use_chirality,
-                sanity_check_k=sanity_check_k,
-                map_size=map_size,
-                max_mols=max_mols,
-            )
-        elif not os.path.exists(data_mdb):
-            pos_lmdb_path = None
+    if os.path.exists(data_mdb):
+        pass
+    elif sdf_path is not None and build_3d_cache_if_missing:
+        _build_or_update_3d_lmdb(
+            root=root,
+            sdf_path=sdf_path,
+            lmdb_path=pos_lmdb_path,
+            mapping_mode=mapping_mode,
+            use_chirality=use_chirality,
+            sanity_check_k=sanity_check_k,
+            map_size=map_size,
+            max_mols=max_mols,
+        )
     else:
         pos_lmdb_path = None
 
