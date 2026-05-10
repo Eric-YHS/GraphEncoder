@@ -7,6 +7,7 @@ data:
   node_in_dim: 9
   edge_in_dim: 3
   use_spd_cache: false
+  preload_pos: true
 
 encoder:
   spd_max_dist: 8

@@ -168,6 +168,7 @@ def load_compare_valid_mask(cfg, condition_system, logger) -> Optional[np.ndarra
 
 def build_loaders(cfg, condition_system, logger):
     use_spd_cache = bool(getattr(cfg.data, "use_spd_cache", False))
+    preload_pos = bool(getattr(cfg.data, "preload_pos", False))
     datasets = get_pcqm4m_dataset(
         root=str(cfg.data.path),
         sdf_path=os.path.join(str(cfg.data.path), "pcqm4m-v2", "pcqm4m-v2-train.sdf"),
@@ -177,6 +178,7 @@ def build_loaders(cfg, condition_system, logger):
         map_size=1 << 40,
         build_spd_cache_if_missing=use_spd_cache,
         spd_max_dist=int(cfg.encoder.spd_max_dist),
+        preload_pos=preload_pos,
     )
     dataset = datasets["train"]
     spd_lmdb_path = datasets["spd_lmdb_path"]
@@ -229,11 +231,12 @@ def build_loaders(cfg, condition_system, logger):
         **common,
     )
     logger.info(
-        "PCQM4M filtered_pos=%d train=%d val=%d test=%d use_spd_cache=%s spd=%s",
+        "PCQM4M filtered_pos=%d train=%d val=%d test=%d preload_pos=%s use_spd_cache=%s spd=%s",
         n,
         len(train_ds),
         len(val_ds),
         n_test,
+        preload_pos,
         use_spd_cache,
         spd_lmdb_path,
     )

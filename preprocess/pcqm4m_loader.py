@@ -294,11 +294,36 @@ class PCQM4Mv2With3D(torch.utils.data.Dataset):
     """
     包装 PyG dataset：返回 Data，并在 train 时附加 data.pos。
     """
-    def __init__(self, pyg_dataset: PygPCQM4Mv2Dataset, indices: np.ndarray, lmdb_path: Optional[str]):
+    def __init__(self, pyg_dataset: PygPCQM4Mv2Dataset, indices: np.ndarray, lmdb_path: Optional[str], preload_pos: bool = False):
         self.pyg_dataset = pyg_dataset  # 原始 2D PyG 数据集
         self.indices = [int(i) for i in indices]  # 该 split 的索引列表
         self.lmdb_path = lmdb_path  # LMDB 路径（valid/test 可为 None）
         self._env = None  # LMDB env（延迟打开，兼容多进程 dataloader）
+        self._pos_cache = None
+        if preload_pos and self.lmdb_path is not None:
+            self._pos_cache = self._load_pos_cache()
+
+    def _load_pos_cache(self):
+        max_idx = max(self.indices) if self.indices else -1
+        cache = [None] * (max_idx + 1)
+        env = lmdb.open(
+            self.lmdb_path,
+            subdir=True,
+            readonly=True,
+            lock=False,
+            readahead=True,
+            meminit=False,
+        )
+        with env.begin(write=False) as txn:
+            cur = txn.cursor()
+            for key, blob in cur:
+                if key == b"__meta__":
+                    continue
+                idx = int(key.decode("utf-8"))
+                if 0 <= idx <= max_idx:
+                    cache[idx] = _bytes_to_np(blob)
+        env.close()
+        return cache
 
     def _get_env(self):
         """延迟打开 LMDB；在每个 worker 进程里各自打开更安全。"""
@@ -322,16 +347,22 @@ class PCQM4Mv2With3D(torch.utils.data.Dataset):
         idx = self.indices[i]  # 取全局 dataset index
         data = self.pyg_dataset[idx]  # 取 2D 图（PyG Data）
 
-        env = self._get_env()  # 打开/获取 LMDB
-        if env is not None:
-            with env.begin(write=False) as txn:  # 开读事务
-                blob = txn.get(str(idx).encode("utf-8"))  # 取出 pos bytes
+        if self._pos_cache is not None:
+            pos = self._pos_cache[idx]
+            if pos is None:
+                raise KeyError(f"3D pos not found in preloaded cache for idx={idx}")
+            data.pos = torch.from_numpy(pos)
+        else:
+            env = self._get_env()  # 打开/获取 LMDB
+            if env is not None:
+                with env.begin(write=False) as txn:  # 开读事务
+                    blob = txn.get(str(idx).encode("utf-8"))  # 取出 pos bytes
 
-            if blob is None:
-                # 没有 3D：可以选择报错或跳过。这里选择显式报错，方便你发现缓存问题。
-                raise KeyError(f"3D pos not found in LMDB for idx={idx}")
-            pos = _bytes_to_np(blob)  # bytes -> numpy (N,3)
-            data.pos = torch.from_numpy(pos)  # 挂到 Data 上（torch.Tensor）
+                if blob is None:
+                    # 没有 3D：可以选择报错或跳过。这里选择显式报错，方便你发现缓存问题。
+                    raise KeyError(f"3D pos not found in LMDB for idx={idx}")
+                pos = _bytes_to_np(blob)  # bytes -> numpy (N,3)
+                data.pos = torch.from_numpy(pos)  # 挂到 Data 上（torch.Tensor）
         data.idx = int(idx)
 
         return data  # 返回 Data（train 有 pos，valid/test 没有）
@@ -403,6 +434,7 @@ def get_pcqm4m_dataset(
     build_spd_cache_if_missing: bool = True,
     spd_max_dist: int = 8,
     spd_map_size: int = 1 << 40,
+    preload_pos: bool = False,
 ) -> Dict[str, Any]:
 
     pcqm_dir = os.path.join(root, "pcqm4m-v2")
@@ -452,7 +484,7 @@ def get_pcqm4m_dataset(
         )
 
     # ✅ 只包装 train（你实际会用它，再 random_split）
-    train_ds = PCQM4Mv2With3D(pyg_dataset, filtered_train_idx, pos_lmdb_path)
+    train_ds = PCQM4Mv2With3D(pyg_dataset, filtered_train_idx, pos_lmdb_path, preload_pos=preload_pos)
 
     # -------------------------
     # (B) SPD LMDB（只对 filtered_train_idx 建）
