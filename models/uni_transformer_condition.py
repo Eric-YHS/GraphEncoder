@@ -1,4 +1,3 @@
-from tkinter import NO
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,20 +24,45 @@ class GraphCondEmbedder(nn.Module):
         super().__init__()
         self.drop_prob = float(drop_prob)
 
-        self.proj = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        # unconditional / dropped condition 的可学习向量（GraphDiT 的 dropped embedding 思路）
+        if in_dim != hidden_dim:
+            self.proj = nn.Linear(in_dim, hidden_dim)
+        else:
+            self.proj = nn.Identity()
         self.null = nn.Parameter(torch.zeros(hidden_dim))
+
+    def make_drop_mask(
+        self,
+        graph_emb: torch.Tensor,
+        unconditioned: bool = False,
+        apply_dropout: bool = True,
+    ):
+        """
+        graph_emb: [B, D] or any [B, ...] flattened beforehand
+        return:
+          drop_mask: [B] bool
+        """
+        assert graph_emb.dim() == 2, "graph_emb for make_drop_mask must be [B, D]"
+        B = graph_emb.size(0)
+        device = graph_emb.device
+
+        force_drop = torch.isnan(graph_emb).any(dim=-1)  # [B]
+
+        if unconditioned:
+            drop_mask = torch.ones(B, device=device, dtype=torch.bool)
+        else:
+            drop_mask = force_drop
+            if apply_dropout and self.training and self.drop_prob > 0:
+                drop_mask = drop_mask | (torch.rand(B, device=device) < self.drop_prob)
+        return drop_mask
 
     def forward(
         self,
         graph_emb: torch.Tensor,      # [B, in_dim]
-        batch: torch.Tensor,          # [N]  node->graph mapping
+        batch: torch.Tensor,          # [N]
         unconditioned: bool = False,
-    ) -> torch.Tensor:
+        apply_dropout: bool = True,
+        drop_mask: torch.Tensor = None,
+    ):
         assert graph_emb.dim() == 2, "graph_embedding must be [num_graphs, graph_emb_dim]"
         num_graphs = int(batch.max().item()) + 1
         assert graph_emb.size(0) == num_graphs, f"graph_emb B={graph_emb.size(0)} != num_graphs={num_graphs}"
@@ -50,28 +74,28 @@ class GraphCondEmbedder(nn.Module):
             assert batch.min().item() >= 0, "batch has negative graph indices"
             assert batch.max().item() < B, f"batch contains index >= B (B={B})"
 
-        force_drop = torch.isnan(graph_emb).any(dim=-1)  # [B] bool
-
-        if unconditioned:
-            drop_mask = torch.ones(B, device=device, dtype=torch.bool)
+        if drop_mask is None:
+            drop_mask = self.make_drop_mask(
+                graph_emb,
+                unconditioned=unconditioned,
+                apply_dropout=apply_dropout,
+            )
         else:
-            drop_mask = force_drop
-            if self.training and self.drop_prob > 0:
-                drop_mask = drop_mask | (torch.rand(B, device=device) < self.drop_prob)
+            assert drop_mask.shape == (B,), f"drop_mask shape must be [{B}], got {tuple(drop_mask.shape)}"
+            assert drop_mask.dtype == torch.bool
 
         safe_graph_emb = graph_emb.masked_fill(drop_mask.unsqueeze(-1), 0.0)
-        emb = self.proj(safe_graph_emb)  # [B, hidden_dim]
-        null = self.null.unsqueeze(0).expand(B, -1)  # [B, hidden_dim]
-        emb = torch.where(drop_mask.unsqueeze(-1), null, emb)  # drop -> null
+        emb = self.proj(safe_graph_emb)                 # [B, hidden_dim]
+        null = self.null.unsqueeze(0).expand(B, -1)    # [B, hidden_dim]
+        emb = torch.where(drop_mask.unsqueeze(-1), null, emb)
 
-        # broadcast to nodes
-        cond_node = emb[batch]  # [N, hidden_dim]
-        return cond_node
+        cond_node = emb[batch]                         # [N, hidden_dim]
+        return cond_node, emb
 
 class BaseX2HAttLayer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, n_heads, edge_feat_dim, r_feat_dim,
                  act_fn='relu', norm=True, ew_net_type='r', out_fc=True,
-                 cond_dim=None):  # ✅ NEW: cond_dim
+                 cond_dim=None, pair_feat_dim=0):  # ✅ NEW: cond_dim
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -83,7 +107,7 @@ class BaseX2HAttLayer(nn.Module):
         self.ew_net_type = ew_net_type
         self.out_fc = out_fc
 
-        kv_input_dim = input_dim * 2 + edge_feat_dim + r_feat_dim
+        kv_input_dim = input_dim * 2 + edge_feat_dim + r_feat_dim + pair_feat_dim
         self.hk_func = MLP(kv_input_dim, output_dim, hidden_dim, norm=norm, act_fn=act_fn)
         self.hv_func = MLP(kv_input_dim, output_dim, hidden_dim, norm=norm, act_fn=act_fn)
         self.hq_func = MLP(input_dim, output_dim, hidden_dim, norm=norm, act_fn=act_fn)
@@ -108,7 +132,7 @@ class BaseX2HAttLayer(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
-    def forward(self, h, r_feat, edge_feat, edge_index, e_w=None, cond_node=None):  # ✅ NEW: cond_node
+    def forward(self, h, r_feat, edge_feat, edge_index, e_w=None, cond_node=None, pair_feat=None):  # ✅ NEW: cond_node
         
         N = h.size(0)
         src, dst = edge_index
@@ -119,6 +143,7 @@ class BaseX2HAttLayer(nn.Module):
             gate = None
         else:
             shift, scale, gate = self.adaLN_modulation(cond_node).chunk(3, dim=-1)  # all [N, D]
+            gate = torch.sigmoid(gate)
             h_mod = modulate(self.norm_h(h), shift, scale)  # [N, D]
 
         hi, hj = h_mod[dst], h_mod[src]
@@ -126,6 +151,8 @@ class BaseX2HAttLayer(nn.Module):
         kv_input = torch.cat([r_feat, hi, hj], -1) 
         if edge_feat is not None:
             kv_input = torch.cat([edge_feat, kv_input], -1) # [E, r_feat_dim + 2*input_dim + edge_feat_dim]
+        if pair_feat is not None:
+            kv_input = torch.cat([pair_feat, kv_input], -1)
 
         k = self.hk_func(kv_input).view(-1, self.n_heads, self.output_dim // self.n_heads)
         v = self.hv_func(kv_input)
@@ -162,7 +189,7 @@ class BaseX2HAttLayer(nn.Module):
 class BaseH2XAttLayer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, n_heads, edge_feat_dim, r_feat_dim,
                  act_fn='relu', norm=True, ew_net_type='r',
-                 cond_dim=None):
+                 cond_dim=None, pair_feat_dim=0):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -173,7 +200,7 @@ class BaseH2XAttLayer(nn.Module):
         self.act_fn = act_fn
         self.ew_net_type = ew_net_type
 
-        kv_input_dim = input_dim * 2 + edge_feat_dim + r_feat_dim
+        kv_input_dim = input_dim * 2 + edge_feat_dim + r_feat_dim + pair_feat_dim
         self.xk_func = MLP(kv_input_dim, output_dim, hidden_dim, norm=norm, act_fn=act_fn)
         self.xv_func = MLP(kv_input_dim, self.n_heads, hidden_dim, norm=norm, act_fn=act_fn)
         self.xq_func = MLP(input_dim, output_dim, hidden_dim, norm=norm, act_fn=act_fn)
@@ -191,7 +218,7 @@ class BaseH2XAttLayer(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
-    def forward(self, h, rel_x, r_feat, edge_feat, edge_index, e_w=None, cond_node=None):  # ✅ NEW
+    def forward(self, h, rel_x, r_feat, edge_feat, edge_index, e_w=None, cond_node=None, pair_feat=None):  # ✅ NEW
         N = h.size(0)
         src, dst = edge_index
         device = h.device
@@ -202,6 +229,7 @@ class BaseH2XAttLayer(nn.Module):
         else:
             out = self.adaLN_modulation(cond_node)  # [N, 2D+1]
             shift, scale, gate_x = torch.split(out, [self.input_dim, self.input_dim, 1], dim=-1)
+            gate_x = torch.sigmoid(gate_x)
             h_mod = modulate(self.norm_h(h), shift, scale)  # [N, D]
             # gate_x: [N,1]
 
@@ -210,6 +238,8 @@ class BaseH2XAttLayer(nn.Module):
         kv_input = torch.cat([r_feat, hi, hj], -1)
         if edge_feat is not None:
             kv_input = torch.cat([edge_feat, kv_input], -1)
+        if pair_feat is not None:
+            kv_input = torch.cat([pair_feat, kv_input], -1)
 
         k = self.xk_func(kv_input).view(-1, self.n_heads, self.output_dim // self.n_heads)
         v = self.xv_func(kv_input)
@@ -241,7 +271,7 @@ class BaseH2XAttLayer(nn.Module):
 class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
     def __init__(self, hidden_dim, n_heads, num_r_gaussian, edge_feat_dim, act_fn='relu', norm=True,
                  num_x2h=1, num_h2x=1, r_min=0., r_max=10., num_node_types=8,
-                 ew_net_type='r', x2h_out_fc=True, sync_twoup=False):
+                 ew_net_type='r', x2h_out_fc=True, sync_twoup=False, pair_feat_dim=0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_heads = n_heads
@@ -256,17 +286,18 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
         self.ew_net_type = ew_net_type
         self.x2h_out_fc = x2h_out_fc
         self.sync_twoup = sync_twoup
+        self.pair_feat_dim = pair_feat_dim
 
         self.distance_expansion = GaussianSmearing(self.r_min, self.r_max, num_gaussians=num_r_gaussian)
 
         # condition
         self.cond_dim = hidden_dim
         self.norm_h = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        self.adaLN_modulation = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 3 * hidden_dim, bias=True),  # shift, scale, gate (all [N, D])
-        )
+        # self.adaLN_modulation = nn.Sequential(
+        #     nn.Linear(hidden_dim, hidden_dim, bias=True),
+        #     nn.SiLU(),
+        #     nn.Linear(hidden_dim, 3 * hidden_dim, bias=True),  # shift, scale, gate (all [N, D])
+        # )
 
         self.x2h_layers = nn.ModuleList()
         for i in range(self.num_x2h):
@@ -274,7 +305,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 BaseX2HAttLayer(hidden_dim, hidden_dim, hidden_dim, n_heads, edge_feat_dim,
                                 r_feat_dim=num_r_gaussian * 2,
                                 act_fn=act_fn, norm=norm,
-                                ew_net_type=self.ew_net_type, out_fc=self.x2h_out_fc, cond_dim=hidden_dim)
+                                ew_net_type=self.ew_net_type, out_fc=self.x2h_out_fc, cond_dim=hidden_dim, pair_feat_dim=self.pair_feat_dim)
             )
         self.h2x_layers = nn.ModuleList()
         for i in range(self.num_h2x):
@@ -282,37 +313,37 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
                 BaseH2XAttLayer(hidden_dim, hidden_dim, hidden_dim, n_heads, edge_feat_dim,
                                 r_feat_dim=num_r_gaussian * 2,
                                 act_fn=act_fn, norm=norm,
-                                ew_net_type=self.ew_net_type, cond_dim=hidden_dim)
+                                ew_net_type=self.ew_net_type, cond_dim=hidden_dim, pair_feat_dim=self.pair_feat_dim)
             )
 
     def forward(self, h, x, 
                 edge_attr,  # cat[edge_type_one_hot, edge_feat], shape=[E_b+E_r, 3+2]
                 edge_type_feat,  # edge_type_feat: edge_type_one_hot, shape=[E_b+E_r, 2]
                 edge_index, # [2, E+b+E_r]
-                mask_ligand, e_w=None, fix_x=False, cond_node=None):
+                mask_ligand, e_w=None, fix_x=False, cond_node=None, pair_feat=None):
         src, dst = edge_index
         if self.edge_feat_dim > 0:
             edge_feat = edge_attr
         else:
             edge_feat = None
 
-        if cond_node is None:
-            h_mod = h
-            gate = None
-        else:
-            shift, scale, gate = self.adaLN_modulation(cond_node).chunk(3, dim=-1)
-            h_mod = modulate(self.norm_h(h), shift, scale)  # [N, D]
+        # if cond_node is None:
+        #     h_mod = h
+        #     gate = None
+        # else:
+        #     shift, scale, gate = self.adaLN_modulation(cond_node).chunk(3, dim=-1)
+        #     h_mod = modulate(self.norm_h(h), shift, scale)  # [N, D]
 
         rel_x = x[dst] - x[src]
         dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
 
-        h_in = h_mod
+        h_in = h
         base_dist_feat = self.distance_expansion(dist)
         base_dist_feat = outer_product(edge_type_feat, base_dist_feat)
 
         for i in range(self.num_x2h):
             h_out = self.x2h_layers[i](
-                h_in, base_dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=None
+                h_in, base_dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=cond_node, pair_feat=pair_feat
             )
             h_in = h_out
         x2h_out = h_in
@@ -323,16 +354,13 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
             dist_feat = outer_product(edge_type_feat, dist_feat)
 
             delta_x = self.h2x_layers[i](
-                new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=None
+                new_h, rel_x, dist_feat, edge_feat, edge_index, e_w=e_w, cond_node=cond_node, pair_feat=pair_feat
             )
             if not fix_x:
                 x = x + delta_x * mask_ligand[:, None]
 
             rel_x = x[dst] - x[src]
             dist = torch.norm(rel_x, p=2, dim=-1, keepdim=True)
-        
-        if gate is not None:
-            x2h_out = x2h_out + gate
 
 
         return x2h_out, x
@@ -343,7 +371,7 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
                  num_r_gaussian=50, edge_feat_dim=0, num_node_types=8, act_fn='relu', norm=True,
                  cutoff_mode='radius', ew_net_type='r',
                  num_init_x2h=1, num_init_h2x=0, num_x2h=1, num_h2x=1,
-                 r_max=10., x2h_out_fc=True, sync_twoup=False, graph_cond_dim:int=0, drop_graph_cond: float = 0.0,):
+                 r_max=10., x2h_out_fc=True, sync_twoup=False, graph_cond_dim:int=0, drop_graph_cond: float = 0.0):
         super().__init__()
         self.num_blocks = num_blocks
         self.num_layers = num_layers
@@ -354,7 +382,6 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
         self.act_fn = act_fn
         self.norm = norm
         self.num_node_types = num_node_types
-
         self.cutoff_mode = cutoff_mode   # ['radius','knn']
         self.k = k
         self.ew_net_type = ew_net_type   # ['r','m','none','global']
@@ -380,12 +407,27 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
         self.drop_graph_cond = float(drop_graph_cond)
         if self.graph_cond_dim > 0:
             self.graph_cond_embedder = GraphCondEmbedder(
-                in_dim=self.graph_cond_dim,
+                in_dim=self.hidden_dim,
                 hidden_dim=self.hidden_dim,
                 drop_prob=self.drop_graph_cond
             )
         else:
             self.graph_cond_embedder = None
+
+        self.pair_in_dim = (
+            2                      # edge_type_feat
+            # + self.num_r_gaussian  # dist_feat_raw
+            # + self.hidden_dim * 2  # h[src], h[dst]
+            + self.hidden_dim      # graph edge cond
+        )
+
+        self.pair_init = MLP(
+            self.pair_in_dim,
+            self.hidden_dim,       # 输出 pair_feat_dim = hidden_dim
+            self.hidden_dim,
+            norm=self.norm,
+            act_fn=self.act_fn
+        )
 
     def _build_share_blocks(self):
         base_block = []
@@ -397,6 +439,7 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
                     num_x2h=self.num_x2h, num_h2x=self.num_h2x,
                     r_max=self.r_max, num_node_types=self.num_node_types,
                     ew_net_type=self.ew_net_type, x2h_out_fc=self.x2h_out_fc, sync_twoup=self.sync_twoup,
+                    pair_feat_dim=self.hidden_dim
                 )
             )
         return nn.ModuleList(base_block)
@@ -414,28 +457,63 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
                 bond_edge_attr=None,
                 graph_embedding=None,      
                 unconditioned: bool = False, 
+                apply_graph_dropout: bool = True,
                 return_delta: bool = False,
                 return_all=False, fix_x=False):
 
         if bond_edge_attr is not None and bond_edge_index is None:
             raise ValueError("Not allowed bond_edge_index is empty but bond_edge_attr is not empty")
 
-        x_in = x  # ✅ keep original noisy x for delta
+        x_in = x
 
-        # ---- ✅ build per-node condition (like GraphDiT: a single c used for all layers) ----
-        cond_node = None
+        graph_cond_layers = None
+        graph_drop_mask = None
+
         if self.graph_cond_embedder is not None:
             if graph_embedding is None:
                 raise ValueError(
                     "graph_cond_dim>0 but graph_embedding is None. "
                     "You are calling the CFG denoiser without global condition."
                 )
-            cond_node = self.graph_cond_embedder(
-                graph_emb=graph_embedding,
-                batch=batch,
-                # training=self.training,
-                unconditioned=unconditioned
-            )  # [N, hidden_dim]
+
+            if graph_embedding.dim() != 2:
+                raise ValueError(
+                    f"graph_embedding must be 2D, got shape={tuple(graph_embedding.shape)}"
+                )
+
+            num_graphs = int(batch.max().item()) + 1
+            if graph_embedding.size(0) != num_graphs:
+                raise ValueError(
+                    f"graph_embedding first dim must match num_graphs={num_graphs}, "
+                    f"got {graph_embedding.size(0)}"
+                )
+
+            # backward compatible:
+            # old graph condition: [B, H] -> broadcast to all inner layers
+            if graph_embedding.size(-1) == self.hidden_dim:
+                graph_cond_layers = graph_embedding.unsqueeze(1).expand(
+                    num_graphs, self.num_layers, self.hidden_dim
+                )  # [B, L, H]
+
+            # new layer-wise graph condition: [B, L*H] -> reshape
+            elif graph_embedding.size(-1) == self.num_layers * self.hidden_dim:
+                graph_cond_layers = graph_embedding.view(
+                    num_graphs, self.num_layers, self.hidden_dim
+                )  # [B, L, H]
+
+            else:
+                raise ValueError(
+                    f"Unsupported graph_embedding dim={graph_embedding.size(-1)}. "
+                    f"Expected hidden_dim={self.hidden_dim} or "
+                    f"num_layers*hidden_dim={self.num_layers * self.hidden_dim}."
+                )
+
+            # one shared CFG/drop mask across all inner layers
+            graph_drop_mask = self.graph_cond_embedder.make_drop_mask(
+                graph_cond_layers.reshape(num_graphs, -1),
+                unconditioned=unconditioned,
+                apply_dropout=apply_graph_dropout,
+            )
 
         all_x = [x]
         all_h = [h]
@@ -448,8 +526,8 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
                 E_b = bond_edge_index.size(1)
                 edge_index = torch.cat([bond_edge_index, edge_index_r], dim=1)
                 edge_type_idx = torch.cat([
-                    torch.zeros(E_b, device=x.device, dtype=torch.long),
-                    torch.ones(E_r,  device=x.device, dtype=torch.long),
+                    torch.zeros(E_b, device=x.device, dtype=torch.long),  # bond
+                    torch.ones(E_r,  device=x.device, dtype=torch.long),  # radius
                 ], dim=0)
             else:
                 E_b = 0
@@ -468,7 +546,10 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
                 assert edge_attr.shape[-1] == self.edge_feat_dim
             else:
                 edge_attr = edge_type_feat
-                assert self.edge_feat_dim == 2, f"bond_edge_attr is None -> edge_attr dim=2, but edge_feat_dim={self.edge_feat_dim}"
+                assert self.edge_feat_dim == 2, (
+                    f"bond_edge_attr is None -> edge_attr dim=2, "
+                    f"but edge_feat_dim={self.edge_feat_dim}"
+                )
 
             if self.ew_net_type == 'global':
                 dist = torch.norm(x[dst] - x[src], p=2, dim=-1, keepdim=True)
@@ -478,10 +559,33 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
             else:
                 e_w = None
 
-            for layer in self.base_block:
+            for layer_idx, layer in enumerate(self.base_block):
+                cond_node_l = None
+                pair_feat_l = None
+
+                if graph_cond_layers is not None:
+                    graph_l = graph_cond_layers[:, layer_idx, :]   # [B, H]
+
+                    cond_node_l, cond_graph_l = self.graph_cond_embedder(
+                        graph_emb=graph_l,
+                        batch=batch,
+                        unconditioned=False,   # drop 已由 shared mask 控制
+                        apply_dropout=False,
+                        drop_mask=graph_drop_mask,
+                    )  # [N,H], [B,H]
+
+                    pair_input_l = torch.cat([
+                        edge_type_feat,                # [E,2]
+                        cond_graph_l[batch[src]],     # [E,H]
+                    ], dim=-1)
+                    pair_feat_l = self.pair_init(pair_input_l)   # [E,H]
+
                 h, x = layer(
                     h, x, edge_attr, edge_type_feat, edge_index, mask_ligand,
-                    e_w=e_w, fix_x=fix_x, cond_node=cond_node
+                    e_w=e_w,
+                    fix_x=fix_x,
+                    cond_node=cond_node_l,
+                    pair_feat=pair_feat_l,
                 )
 
             all_x.append(x)
@@ -493,4 +597,3 @@ class UniTransformerO2TwoUpdateGeneral_CFG(nn.Module):
         if return_all:
             outputs.update({'all_x': all_x, 'all_h': all_h})
         return outputs
-

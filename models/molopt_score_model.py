@@ -130,6 +130,52 @@ def to_torch_const(x):
     return x
 
 
+def sample_time_symmetric_middle_bias(
+    num_graphs: int,
+    num_timesteps: int,
+    device: torch.device,
+    min_frac: float = 0.1,
+    max_frac: float = 0.9,
+    beta_alpha: float = 2.0,
+):
+    """
+    Symmetric middle-biased timestep sampling.
+
+    - First restrict timesteps to a broad middle band [min_frac, max_frac].
+- Then bias samples toward the center with a symmetric Beta(alpha, alpha).
+    - alpha=1 reduces to uniform sampling within the band.
+    """
+    if not (0.0 <= min_frac < max_frac <= 1.0):
+        raise ValueError(f"Expected 0 <= min_frac < max_frac <= 1, got {min_frac}, {max_frac}")
+    if beta_alpha <= 0:
+        raise ValueError(f"beta_alpha must be > 0, got {beta_alpha}")
+
+    max_step = num_timesteps - 1
+    t_min = int(round(max_step * min_frac))
+    t_max = int(round(max_step * max_frac))
+    t_min = max(0, min(t_min, max_step))
+    t_max = max(t_min, min(t_max, max_step))
+
+    if t_min == t_max:
+        t = torch.full((num_graphs,), t_min, device=device, dtype=torch.long)
+        pt = torch.ones_like(t, dtype=torch.float) / float(num_timesteps)
+        return t, pt
+
+    half = num_graphs // 2 + 1
+    if abs(beta_alpha - 1.0) < 1e-8:
+        u_half = torch.rand(half, device=device)
+    else:
+        alpha = torch.tensor(float(beta_alpha), device=device)
+        beta_dist = torch.distributions.Beta(alpha, alpha)
+        u_half = beta_dist.sample((half,)).to(device)
+
+    u = torch.cat([u_half, 1.0 - u_half], dim=0)[:num_graphs]
+    t = t_min + torch.round(u * (t_max - t_min)).long()
+    t = t.clamp_(t_min, t_max)
+    pt = torch.ones_like(t, dtype=torch.float) / float(num_timesteps)
+    return t, pt
+
+
 def center_pos(protein_pos, ligand_pos, batch_protein, batch_ligand, mode='protein'):
     if mode == 'none':
         offset = 0.
@@ -264,6 +310,9 @@ class MolPosDiffusion(nn.Module):
         self.model_mean_type = config.model_mean_type  # 建议用 'C0'（直接预测 x0）
         self.sample_time_method = config.sample_time_method  # ['importance','symmetric']
         self.center_pos_mode = getattr(config, "center_pos_mode", "graph")  # ['none','graph']
+        self.sample_time_min_frac = float(getattr(config, "sample_time_min_frac", 0.1))
+        self.sample_time_max_frac = float(getattr(config, "sample_time_max_frac", 0.9))
+        self.sample_time_beta_alpha = float(getattr(config, "sample_time_beta_alpha", 2.0))
 
         self.hidden_dim = config.hidden_dim
 
@@ -330,10 +379,14 @@ class MolPosDiffusion(nn.Module):
             return t, pt
 
         if method == 'symmetric':
-            t = torch.randint(0, self.num_timesteps, size=(num_graphs // 2 + 1,), device=device)
-            t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:num_graphs]
-            pt = torch.ones_like(t).float() / self.num_timesteps
-            return t, pt
+            return sample_time_symmetric_middle_bias(
+                num_graphs=num_graphs,
+                num_timesteps=self.num_timesteps,
+                device=device,
+                min_frac=self.sample_time_min_frac,
+                max_frac=self.sample_time_max_frac,
+                beta_alpha=self.sample_time_beta_alpha,
+            )
 
         raise ValueError(method)
 
@@ -679,6 +732,9 @@ class MolPosDiffusion_condition(nn.Module):
         self.model_mean_type = config.model_mean_type  # 建议用 'C0'（直接预测 x0）
         self.sample_time_method = config.sample_time_method  # ['importance','symmetric']
         self.center_pos_mode = getattr(config, "center_pos_mode", "graph")  # ['none','graph']
+        self.sample_time_min_frac = float(getattr(config, "sample_time_min_frac", 0.1))
+        self.sample_time_max_frac = float(getattr(config, "sample_time_max_frac", 0.9))
+        self.sample_time_beta_alpha = float(getattr(config, "sample_time_beta_alpha", 2.0))
 
         self.hidden_dim = config.hidden_dim
 
@@ -718,7 +774,6 @@ class MolPosDiffusion_condition(nn.Module):
 
         # node dropout
         self.node_dropout = config.node_dropout
-        self.node_dropout_type = getattr(config, "node_dropout_type", "node")
 
     def _ensure_graph_emb(self, graph_emb: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
         """
@@ -772,10 +827,14 @@ class MolPosDiffusion_condition(nn.Module):
             return t, pt
 
         if method == 'symmetric':
-            t = torch.randint(0, self.num_timesteps, size=(num_graphs // 2 + 1,), device=device)
-            t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:num_graphs]
-            pt = torch.ones_like(t).float() / self.num_timesteps
-            return t, pt
+            return sample_time_symmetric_middle_bias(
+                num_graphs=num_graphs,
+                num_timesteps=self.num_timesteps,
+                device=device,
+                min_frac=self.sample_time_min_frac,
+                max_frac=self.sample_time_max_frac,
+                beta_alpha=self.sample_time_beta_alpha,
+            )
 
         raise ValueError(method)
 
@@ -792,6 +851,7 @@ class MolPosDiffusion_condition(nn.Module):
         return_all=False,
         fix_x=False,
         unconditioned: bool = False,  # ✅ 可选：用于你做 ablation（不用 CFG 也可以不用它）
+        apply_graph_dropout: bool = True,
     ):
         """
         pos_t: [N,3] noisy coords
@@ -801,26 +861,17 @@ class MolPosDiffusion_condition(nn.Module):
         time_step: [B] long
         bond_edge_index: [2,E_b]
         """
-        # ---- normalize graph_emb to [B,cond_dim]
         graph_emb = self._ensure_graph_emb(graph_emb, batch)  # [B,cond_dim]
-
-        # ---- project node & graph conditions
         hc_node = self.cond_proj(cond_node_emb)  # [N,H]
         
         # random dropout node embeddings
         if self.training and self.node_dropout > 0:
             keep_prob = 1.0 - self.node_dropout
-            if self.node_dropout_type in ["node", "both"]:
-                keep_mask = (torch.rand(hc_node.size(0), device=hc_node.device) < keep_prob).float().unsqueeze(-1)
-                # hc = hc * keep_mask / max(keep_prob, 1e-6)
-                hc_node = hc_node * keep_mask
-            
-            if self.node_dropout_type in ["feature", "both"]:
-                hc_node = F.dropout(hc_node, p = self.node_dropout, training=True)
+            keep_mask = (torch.rand(hc_node.size(0), device=hc_node.device) < keep_prob).float().unsqueeze(-1)
+            hc_node = hc_node * keep_mask / keep_prob
 
         feats = [hc_node]
 
-        # ---- time feature
         if self.time_emb_dim > 0:
             if self.time_emb_mode == "sin":
                 t_feat = self.time_emb(time_step)      # [B,Dt]
@@ -834,19 +885,26 @@ class MolPosDiffusion_condition(nn.Module):
         # mask: molecule-only => all ones (update all nodes)
         mask = torch.ones((x.size(0),), device=x.device, dtype=torch.float)
 
-        # ✅ 把 graph_emb 作为全局条件传入 refine_net（与你前面改的 UniTransformer 一致）
         out = self.refine_net(
             h0, pos_t, mask, batch,
             bond_edge_index=bond_edge_index,
             bond_edge_attr=bond_edge_attr,
             graph_embedding=graph_emb,
             unconditioned=unconditioned,
+            apply_graph_dropout=apply_graph_dropout,
             return_all=return_all,
             fix_x=fix_x
         )
         return out
 
-    def get_diffusion_loss(self, batch, cond_node_emb, graph_emb, time_step=None):
+    def get_diffusion_loss(
+        self,
+        batch,
+        cond_node_emb,
+        graph_emb,
+        time_step=None,
+        apply_graph_dropout: bool = True,
+    ):
         """
         batch: PyG Batch with .pos .x .edge_index .batch
         cond_node_emb: [N,cond_dim] encoder output aligned with nodes
@@ -856,6 +914,7 @@ class MolPosDiffusion_condition(nn.Module):
         x = batch.x
         bond_edge_index = batch.edge_index
         bond_edge_attr = batch.edge_attr.float() if getattr(batch, "edge_attr", None) is not None else None
+        bond_edge_attr = None
         
 
         batch_id = batch.batch
@@ -882,6 +941,7 @@ class MolPosDiffusion_condition(nn.Module):
             return_all=False,
             fix_x=False,
             unconditioned=False,
+            apply_graph_dropout=apply_graph_dropout,
         )
         pred = out['x']  # [N,3]
         pred, _ = center_pos_mol(pred, batch_id, mode=self.center_pos_mode)
@@ -954,6 +1014,7 @@ class MolPosDiffusion_condition(nn.Module):
         x = batch_obj.x
         bond_edge_index = batch_obj.edge_index
         bond_edge_attr = batch_obj.edge_attr.float() if getattr(batch_obj, "edge_attr", None) is not None else None
+        bond_edge_attr = None
 
         out = self.forward(
             pos_t=x_t,
@@ -1141,6 +1202,9 @@ class MolPosDiffusion_cat(nn.Module):
         self.model_mean_type = config.model_mean_type  # 建议用 'C0'（直接预测 x0）
         self.sample_time_method = config.sample_time_method  # ['importance','symmetric']
         self.center_pos_mode = getattr(config, "center_pos_mode", "graph")  # ['none','graph']
+        self.sample_time_min_frac = float(getattr(config, "sample_time_min_frac", 0.1))
+        self.sample_time_max_frac = float(getattr(config, "sample_time_max_frac", 0.9))
+        self.sample_time_beta_alpha = float(getattr(config, "sample_time_beta_alpha", 2.0))
 
         self.hidden_dim = config.hidden_dim
         self.cond_dim = cond_dim
@@ -1182,7 +1246,6 @@ class MolPosDiffusion_cat(nn.Module):
 
         # node dropout
         self.node_dropout = config.node_dropout
-        self.node_dropout_type = getattr(config, "node_dropout_type", "node")
 
     def q_pos_sample(self, x0: torch.Tensor, t: torch.Tensor, batch: torch.Tensor):
         """
@@ -1213,10 +1276,14 @@ class MolPosDiffusion_cat(nn.Module):
             return t, pt
 
         if method == 'symmetric':
-            t = torch.randint(0, self.num_timesteps, size=(num_graphs // 2 + 1,), device=device)
-            t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:num_graphs]
-            pt = torch.ones_like(t).float() / self.num_timesteps
-            return t, pt
+            return sample_time_symmetric_middle_bias(
+                num_graphs=num_graphs,
+                num_timesteps=self.num_timesteps,
+                device=device,
+                min_frac=self.sample_time_min_frac,
+                max_frac=self.sample_time_max_frac,
+                beta_alpha=self.sample_time_beta_alpha,
+            )
 
         raise ValueError(method)
 
