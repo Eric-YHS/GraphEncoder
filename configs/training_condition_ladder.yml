@@ -6,6 +6,7 @@ data:
   max_mols: null
   node_in_dim: 9
   edge_in_dim: 3
+  use_spd_cache: false
 
 encoder:
   spd_max_dist: 8

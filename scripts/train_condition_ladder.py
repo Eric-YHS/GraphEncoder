@@ -16,6 +16,7 @@ from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset, random_split
+from torch_geometric.data import Batch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -166,6 +167,7 @@ def load_compare_valid_mask(cfg, condition_system, logger) -> Optional[np.ndarra
 
 
 def build_loaders(cfg, condition_system, logger):
+    use_spd_cache = bool(getattr(cfg.data, "use_spd_cache", False))
     datasets = get_pcqm4m_dataset(
         root=str(cfg.data.path),
         sdf_path=os.path.join(str(cfg.data.path), "pcqm4m-v2", "pcqm4m-v2-train.sdf"),
@@ -173,12 +175,12 @@ def build_loaders(cfg, condition_system, logger):
         mapping_mode="order",
         max_mols=getattr(cfg.data, "max_mols", None),
         map_size=1 << 40,
-        build_spd_cache_if_missing=True,
+        build_spd_cache_if_missing=use_spd_cache,
         spd_max_dist=int(cfg.encoder.spd_max_dist),
     )
     dataset = datasets["train"]
     spd_lmdb_path = datasets["spd_lmdb_path"]
-    if spd_lmdb_path is None:
+    if use_spd_cache and spd_lmdb_path is None:
         raise RuntimeError("PCQM4M SPD LMDB is missing.")
 
     n = len(dataset)
@@ -197,7 +199,10 @@ def build_loaders(cfg, condition_system, logger):
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size(), rank=rank(), shuffle=True, drop_last=True) if is_dist() else None
     val_sampler = DistributedSampler(val_ds, num_replicas=world_size(), rank=rank(), shuffle=False, drop_last=False) if is_dist() else None
-    collate_fn = CollateWithSPDEdgeLmdb(spd_lmdb_path, spd_max_dist=int(cfg.encoder.spd_max_dist))
+    if use_spd_cache:
+        collate_fn = CollateWithSPDEdgeLmdb(spd_lmdb_path, spd_max_dist=int(cfg.encoder.spd_max_dist))
+    else:
+        collate_fn = Batch.from_data_list
     num_workers = int(cfg.train.num_workers)
     common = {
         "num_workers": num_workers,
@@ -224,11 +229,12 @@ def build_loaders(cfg, condition_system, logger):
         **common,
     )
     logger.info(
-        "PCQM4M filtered_pos=%d train=%d val=%d test=%d spd=%s",
+        "PCQM4M filtered_pos=%d train=%d val=%d test=%d use_spd_cache=%s spd=%s",
         n,
         len(train_ds),
         len(val_ds),
         n_test,
+        use_spd_cache,
         spd_lmdb_path,
     )
     return train_loader, val_loader, train_sampler
