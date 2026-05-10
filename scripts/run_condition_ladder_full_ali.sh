@@ -13,12 +13,17 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
 SOURCE=${1:?usage: bash scripts/run_condition_ladder_full_ali.sh none|property|grale_official [gpu_csv]}
 GPUS=${2:-0,1,2,3}
-DATA_ROOT=${DATA_ROOT:-/mnt2/luyifeng/diff4MoleculeRepresentation/data/PCQM4M}
+LOCAL_DATA_ROOT=/root/condition_ladder_data/PCQM4M
+if [ -d "${LOCAL_DATA_ROOT}/pcqm4m-v2/processed" ]; then
+  DATA_ROOT=${DATA_ROOT:-${LOCAL_DATA_ROOT}}
+else
+  DATA_ROOT=${DATA_ROOT:-/mnt2/luyifeng/diff4MoleculeRepresentation/data/PCQM4M}
+fi
 NPROC=$(python -c "print(len('${GPUS}'.split(',')))")
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29551}
 TARGET_GLOBAL_BATCH=${TARGET_GLOBAL_BATCH:-8192}
-PER_GPU_BATCH=${PER_GPU_BATCH:-1024}
+PER_GPU_BATCH=${PER_GPU_BATCH:-$((TARGET_GLOBAL_BATCH / NPROC))}
 MIN_PER_GPU_BATCH=${MIN_PER_GPU_BATCH:-128}
 AUTO_BATCH_ON_FAIL=${AUTO_BATCH_ON_FAIL:-true}
 
