@@ -329,7 +329,11 @@ def condition_probes(diffusion, condition_system, batch, device, fixed_t_values)
         seed = 1000003 + int(t_value)
         zero_graph = torch.zeros_like(graph_cond)
         if num_graphs > 1:
-            shuf_graph = graph_cond[torch.randperm(num_graphs, device=device)]
+            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+                torch.manual_seed(seed + 17)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(seed + 17)
+                shuf_graph = graph_cond[torch.randperm(num_graphs, device=device)]
         else:
             shuf_graph = graph_cond
         results[int(t_value)] = {
