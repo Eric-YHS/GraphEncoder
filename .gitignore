@@ -148,4 +148,13 @@ logs_downstream_sweep_runs/
 logs_embedding/
 logs_sweep_daemon/
 sweep_daemon.log
-sweep_daemon.pid
+# 运行时产物（训练/扫描/评估生成，不入库）
+logs_*/
+outputs/
+sampling_results/*
+!sampling_results/.gitignore
+sweep_daemon.log
+sweep_proc_logs/
+*.out.tfevents.*
+eval_covmat.json
+.ipynb_checkpoints/
