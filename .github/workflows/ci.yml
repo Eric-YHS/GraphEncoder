@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # 训练/推理需要 CUDA + PyTorch/PyG/RDKit，这里只做不依赖它们的静态检查，
+  # 目的是把语法错误、坏配置、误提交的运行产物挡在 main 之外。
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install lightweight tooling
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Byte-compile all Python sources (syntax gate)
+        run: python -m compileall -q models utils scripts preprocess
+
+      - name: Parse YAML configs and environment file
+        run: |
+          python - <<'PY'
+          import glob
+          import yaml
+
+          files = sorted(glob.glob('configs/**/*.y*ml', recursive=True)) + ['environment.yaml']
+          for path in files:
+              with open(path, encoding='utf-8') as handle:
+                  doc = yaml.safe_load(handle)
+              if not isinstance(doc, dict) or not doc:
+                  raise SystemExit(f'{path}: expected a non-empty mapping')
+              print(f'ok {path}')
+          PY
+
+      - name: Validate notebooks are well-formed JSON
+        run: |
+          python - <<'PY'
+          import glob
+          import json
+
+          for path in sorted(glob.glob('notebooks/**/*.ipynb', recursive=True)):
+              with open(path, encoding='utf-8') as handle:
+                  nb = json.load(handle)
+              assert 'cells' in nb, f'{path}: missing "cells"'
+              errors = [
+                  (i, o.get('ename'))
+                  for i, c in enumerate(nb['cells'])
+                  for o in c.get('outputs', [])
+                  if o.get('output_type') == 'error'
+              ]
+              if errors:
+                  raise SystemExit(f'{path}: stored error outputs {errors}')
+              print(f'ok {path} ({len(nb["cells"])} cells)')
+          PY
+
+      - name: Keep runtime artefacts out of version control
+        run: |
+          bad=$(git ls-files \
+            -- '*.pid' '*.out.tfevents.*' 'logs_diffusion_evaluation/*' \
+            'logs_downstream_sweep_daemon/*' 'sweep_proc_logs/*' 'eval_covmat.json')
+          if [ -n "$bad" ]; then
+            echo "These runtime artefacts are tracked; run: git rm --cached <file>"
+            echo "$bad"
+            exit 1
+          fi
+          echo "ok: no runtime artefacts tracked"
