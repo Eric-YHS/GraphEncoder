@@ -158,3 +158,5 @@ sweep_proc_logs/
 *.out.tfevents.*
 eval_covmat.json
 .ipynb_checkpoints/
+sweep_daemon.pid
+*.pid
