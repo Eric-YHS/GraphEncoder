@@ -71,3 +71,54 @@ jobs:
             exit 1
           fi
           echo "ok: no runtime artefacts tracked"
+
+  # 密钥一旦 commit 进历史就很难清干净（science-pop 就漏过一个 Coze PAT）。
+  # 这里只匹配高置信度的前缀，不做熵分析，避免把 CI 变成误报噪音。
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan tracked files for committed credentials
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+
+          PATTERNS = [
+              ("GitHub token", re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{20,}\b")),
+              ("GitHub fine-grained PAT", re.compile(r"\bgithub_pat_[0-9A-Za-z_]{30,}\b")),
+              ("OpenAI-style key", re.compile(r"\bsk-[0-9A-Za-z_-]{20,}\b")),
+              ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+              ("Slack token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b")),
+              ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b")),
+              ("WeChat app secret", re.compile(
+                  r"(?i)\b(wxappsecret|wx_app_secret|app_secret)\b\s*[:=]\s*['\"]?([0-9a-f]{32})['\"]?")),
+              ("Coze PAT", re.compile(r"\bpat_[0-9A-Za-z]{20,}\b")),
+          ]
+          SKIP = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz",
+                  ".pkl", ".pt", ".pth", ".ckpt", ".onnx", ".bin", ".dll", ".so", ".pdb",
+                  ".docx", ".hdr", ".ttf", ".woff", ".woff2", ".mp3", ".mp4", ".wav", ".h5",
+                  ".safetensors", ".lock", ".whl", ".jar", ".class"}
+
+          files = subprocess.run(["git", "ls-files", "-z"], capture_output=True,
+                                 text=True).stdout.split("\0")
+          hits = []
+          for name in filter(None, files):
+              if name.endswith(tuple(SKIP)):
+                  continue
+              try:
+                  blob = open(name, "rb").read(2 * 1024 * 1024)
+              except OSError:
+                  continue
+              if b"\0" in blob:
+                  continue
+              text = blob.decode("utf-8", "replace")
+              for label, pat in PATTERNS:
+                  for m in pat.finditer(text):
+                      hits.append(f"{label}: {name}: {m.group(0)[:24]}")
+          if hits:
+              print("\n".join(hits))
+              sys.exit("发现疑似明文密钥（见上）；确认是误报就把该文件加进 SKIP 或换成占位符")
+          print(f"ok  已扫描 {len([f for f in files if f])} 个文件，未发现明文密钥")
+          PY
